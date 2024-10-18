@@ -35,6 +35,7 @@ from ..distributed import (
     gather_along_first_dim,
     _fsdp_scatter_tensors,
     _fsdp_gather_tensors,
+    alltoall,
 )
 from ..cpp_extensions import (
     fp8_gemm,
@@ -48,12 +49,11 @@ from ..graph import is_graph_capturing
 from ..float8_tensor import Float8Tensor
 from ..export import is_in_onnx_export_mode
 from ..tensor import QuantizedTensor
-from .a2a_linear import _A2ALinear
 
-__all__ = ["Linear"]
+__all__ = ["_A2ALinear"]
 
 
-class _Linear(torch.autograd.Function):
+class _A2ALinear(torch.autograd.Function):
     """Linear semi-top level module
     Calls custom cuda extensions.
     """
@@ -84,6 +84,9 @@ class _Linear(torch.autograd.Function):
         ub_name: str,
         fp8_output: bool,
         fsdp_group: Union[dist_group_type, None],
+        ep_group: Union[dist_group_type, None],
+        ep_size: int,
+        moe_alltoall_overlap: bool,
     ) -> torch.Tensor:
         is_input_fp8 = isinstance(inp, Float8Tensor)
 
@@ -97,6 +100,31 @@ class _Linear(torch.autograd.Function):
 
         tp_world_size = get_distributed_world_size(tp_group)
         ub_overlap_rs = False if tp_world_size == 1 else ub_overlap_rs
+        ub_overlap_ag = False if tp_world_size == 1 else ub_overlap_ag
+
+        #(TODO: Gao for debug) some control commands
+        # here moe_alltoall_overlap means move a2a and ag into TE side, does not necessarily means they are going to be overlap
+        a2a_ag_overlap = False # column mode
+        a2a_rs_overlap = False # row mode
+
+        #Fake cmd to control TP UB overlap:
+        # ub_overlap_ag = True
+        # ub_overlap_rs = True
+
+        ## end of debug cmds
+
+
+        if moe_alltoall_overlap and ep_size!=1 and not a2a_ag_overlap and parallel_mode=='column':
+            # A2A communication - evenly distributed
+            inputmat, _ = alltoall(
+                None, # don't assign output for now
+                inputmat,
+                None, #input_splits for now
+                None, #output_splits for now
+                ep_group,
+                False, #synchronous operation
+                )
+
 
         # Cast input to expected dtype
         inputmat = cast_if_needed(inputmat, activation_dtype)
@@ -145,10 +173,19 @@ class _Linear(torch.autograd.Function):
             # around this by filling the buffer instead.
             if is_in_onnx_export_mode():
                 inputmat_scale_inv.fill_(inputmat_scale_inv.item())
-
+        
+        
         # Column Parallel Linear
         if parallel_mode == "column" and sequence_parallel:
-            inputmat_total, _ = gather_along_first_dim(inputmat, tp_group)
+            if ub_overlap_ag and not fp8:
+                # (TODO: Gao) support fp8 later. Here this `not fp8` is inappropriate
+                dim_size = list(inputmat.size())
+                dim_size[0] = dim_size[0] * tp_world_size
+                ub_obj_gemmin = get_ub(ub_name + "_fprop")
+                inputmat_total = ub_obj_gemmin.get_ubuf_output(1)
+                gemm_in = ub_obj_gemmin.get_ubuf_output(0)
+            else:
+                inputmat_total, _ = gather_along_first_dim(inputmat, tp_group)
         else:
             inputmat_total = inputmat
         if fp8:
@@ -256,13 +293,18 @@ class _Linear(torch.autograd.Function):
                     -amin, amax
                 ).float()
 
-            if ub_overlap_rs:
+            ub_algo = None
+            ub_obj = None
+            extra_output_tensor = None
+            if ub_overlap_rs and parallel_mode == "row":
                 ub_obj_projout = get_ub(ub_name + "_fprop")
+                ub_obj = ub_obj_projout
                 out = ub_obj_projout.get_ubuf_output(1)
                 dim_size = list(inputmat_total.size())
                 dim_size[0] = dim_size[0] // get_distributed_world_size(tp_group)
                 dim_size[1] = weight.size(0)
                 rs_out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
+                extra_output_tensor = rs_out
                 if ub_obj_projout.is_p2p_overlap():
                     ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS_P2P
                 else:
@@ -272,6 +314,16 @@ class _Linear(torch.autograd.Function):
                 dim_size[1] = weight.size(0)
                 out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
 
+            if ub_overlap_ag and parallel_mode == "column":
+                ub_obj = ub_obj_gemmin
+                if ub_obj_gemmin.is_atomic_gemm():
+                    ub_algo = tex.UbufOverlapAlgo.ATOMIC_GEMM_AG_P2P
+                else:
+                    ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG_P2P
+                
+                extra_output_tensor = torch.empty_like(gemm_in)
+
+            
             _ = gemm(
                 weight,
                 inputmat_total,
@@ -280,9 +332,9 @@ class _Linear(torch.autograd.Function):
                 bias=bias,
                 use_bias=use_bias,
                 out=out,
-                ub_algo=ub_algo if ub_overlap_rs else None,
-                ub=ub_obj_projout if ub_overlap_rs else None,
-                extra_output_tensor=rs_out if ub_overlap_rs else None,
+                ub_algo=ub_algo,
+                ub=ub_obj,
+                extra_output_tensor= extra_output_tensor,
             )
 
         if is_grad_enabled:
@@ -349,20 +401,52 @@ class _Linear(torch.autograd.Function):
                     ctx.reduce_and_update_bwd_fp8_tensors
                     or FP8GlobalStateManager.is_first_fp8_module()
                 )
+            ctx.ep_group = ep_group
+            ctx.ep_size = ep_size
+            ctx.moe_alltoall_overlap = moe_alltoall_overlap
 
+
+        # if parallel_mode=="row":
+        #     torch.distributed.barrier()
+        #     print(f"Gao after barrier rank={torch.distributed.get_rank()} mean={torch.mean(out)} var={torch.var(out)} sequence_parallel{sequence_parallel}")
+        #     exit()
+        
         # Row Parallel Linear
-        if ub_overlap_rs:
+        if ub_overlap_rs and parallel_mode == "row":
             out = rs_out
         elif parallel_mode == "row" and sequence_parallel:
+            # no ub based overlap
             out, _ = reduce_scatter_along_first_dim(out, tp_group)
         elif parallel_mode == "row" and tensor_parallel:
             out, _ = allreduce(out, tp_group)
+
+        
+
+        # Make sure the saved input for bwd is correct basically something after a2a before ag
+        if parallel_mode == "row" and moe_alltoall_overlap and not a2a_rs_overlap:
+            if ep_size!=1:
+                out, _ = alltoall(
+                    None,
+                    out,
+                    None,
+                    None,
+                    ep_group,
+                    False,
+                )
 
         # [*, in_features] -> [*, out_features] except first dimension changes for SP
         return out.view(-1, *inp.shape[1:-1], out.shape[-1])
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
+
+        # (TODO: Gao) my backward control port:
+        rs_a2a_overlap = False # get rid of max_num_device_connections = 1 or green context
+        a2a_ag_overlap = False # might easier to do
+
+        # end of debug control session
+
+
         if isinstance(grad_output, Float8Tensor):
             ctx.fp8_meta["scaling_bwd"].scale_inv[
                 tex.FP8BwdTensors.GRAD_OUTPUT1
@@ -403,6 +487,21 @@ class _Linear(torch.autograd.Function):
                     ub_algo = tex.UbufOverlapAlgo.ATOMIC_GEMM_AG_P2P
                 else:
                     ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG_P2P
+            
+            # A2A communication:
+            # Row parallel gemm, FC2 : a2a_ag_dgrad overlap
+            # Col parallel gemm, FC1 : a2a_rs overlap and bulk overlap with FC2 wgemm 
+
+            if ctx.parallel_mode == "row" and ctx.moe_alltoall_overlap and not a2a_ag_overlap:
+                grad_output, _ = alltoall(
+                    None, # don't assign output for now
+                    grad_output,
+                    None, #input_splits for now
+                    None, #output_splits for now
+                    ctx.ep_group,
+                    False, #synchronous operation
+                    )
+
 
             (
                 grad_output,
@@ -495,6 +594,10 @@ class _Linear(torch.autograd.Function):
                         ),
                         ub=ctx.ub_obj_gradout if ctx.ub_overlap_ag else None,
                     )
+                    if parallel_mode=="row":
+                        torch.distributed.barrier()
+                        print(f"Gao after barrier rank={torch.distributed.get_rank()} mean={torch.mean(out)} var={torch.var(out)} sequence_parallel{sequence_parallel}")
+                        exit()
 
                 # Overlap dgrad-RS/AR with wgrad
                 if ctx.parallel_mode == "column" and ctx.sequence_parallel:
@@ -573,6 +676,18 @@ class _Linear(torch.autograd.Function):
             # Column Parallel Linear
             if ctx.parallel_mode == "column" and ctx.tensor_parallel and handle is not None:
                 handle.wait()
+            
+            # a2a for dgrad RS data from column gemm
+            if ctx.parallel_mode == "column" and ctx.moe_alltoall_overlap and not rs_a2a_overlap:
+                if ctx.ep_size !=1:
+                    dgrad, _ = alltoall(
+                        None, # don't assign output for now
+                        dgrad,
+                        None, #input_splits for now
+                        None, #output_splits for now
+                        ctx.ep_group,
+                        False, #synchronous operation
+                        )
 
             if not ctx.use_bias:
                 grad_bias = None
@@ -631,414 +746,7 @@ class _Linear(torch.autograd.Function):
             None,  # ub_name
             None,  # fp8_output
             None,  # fsdp_group
+            None,  # ep_group
+            None,  # ep_size
+            None,  # moe_alltoall_overlap
         )
-
-
-class Linear(TransformerEngineBaseModule):
-    """Applies a linear transformation to the incoming data :math:`y = xA^T + b`
-
-    On NVIDIA GPUs it is a drop-in replacement for `torch.nn.Linear`.
-
-    Parameters
-    ----------
-    in_features : int
-                 size of each input sample.
-    out_features : int
-                  size of each output sample.
-    bias : bool, default = `True`
-          if set to `False`, the layer will not learn an additive bias.
-    init_method : Callable, default = `None`
-                 used for initializing weights in the following way: `init_method(weight)`.
-                 When set to `None`, defaults to `torch.nn.init.normal_(mean=0.0, std=0.023)`.
-    get_rng_state_tracker : Callable, default = `None`
-                 used to get the random number generator state tracker for initializing weights.
-    rng_tracker_name : str, default = `None`
-                 the param passed to get_rng_state_tracker to get the specific rng tracker.
-    parameters_split : Optional[Union[Tuple[str, ...], Dict[str, int]]], default = None
-                      Configuration for splitting the weight and bias tensors along dim 0 into
-                      multiple PyTorch parameters. If a list or tuple of strings is provided,
-                      they are used to make the names of equally-sized parameters. If a dict
-                      (preferably an OrderedDict) is provided, the keys are used as names and
-                      values as split sizes along dim 0. The resulting parameters will have
-                      names that end in `_weight` or `_bias`, so trailing underscores are
-                      stripped from any provided names.
-    device : Union[torch.device, str], default = "cuda"
-          The device on which the parameters of the model will be allocated. It is the user's
-          responsibility to ensure all parameters are moved to the GPU before running the
-          forward pass.
-
-    Parallelism parameters
-    ----------------------
-    sequence_parallel : bool, default = `False`
-                       if set to `True`, uses sequence parallelism.
-    tp_group : ProcessGroup, default = `None`
-              tensor parallel process group.
-    tp_size : int, default = 1
-             used as TP (tensor parallel) world size when TP groups are not formed during
-             initialization. In this case, users must call the
-             `set_tensor_parallel_group(tp_group)` method on the initialized module before the
-             forward pass to supply the tensor parallel group needed for tensor and sequence
-             parallel collectives.
-    parallel_mode : {None, 'column', 'row'}, default = `None`
-                   used to decide whether this Linear layer is Column Parallel Linear or Row
-                   Parallel Linear as described `here <https://arxiv.org/pdf/1909.08053.pdf>`_.
-                   When set to `None`, no communication is performed.
-
-    Optimization parameters
-    -----------------------
-    fuse_wgrad_accumulation : bool, default = 'False'
-                             if set to `True`, enables fusing of creation and accumulation of
-                             the weight gradient. When enabled, it is assumed that the weights
-                             have an additional `main_grad` attribute (used instead of the
-                             regular `grad`) which is a pre-allocated buffer of the correct
-                             size to accumulate gradients in.
-    return_bias : bool, default = `False`
-                 when set to `True`, this module will not apply the additive bias itself, but
-                 instead return the bias value during the forward pass together with the
-                 output of the linear transformation :math:`y = xA^T`. This is useful when
-                 the bias addition can be fused to subsequent operations.
-    params_dtype : torch.dtype, default = `torch.get_default_dtype()`
-                  it controls the type used to allocate the initial parameters. Useful when
-                  the model is trained with lower precision and the original FP32 parameters
-                  would not fit in GPU memory.
-
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        sequence_parallel: bool = False,
-        fuse_wgrad_accumulation: bool = False,
-        tp_group: Optional[dist_group_type] = None,
-        tp_size: int = 1,
-        get_rng_state_tracker: Optional[Callable] = None,
-        rng_tracker_name: Optional[str] = None,
-        init_method: Optional[Callable] = None,
-        bias: bool = True,
-        return_bias: bool = False,
-        params_dtype: Optional[torch.dtype] = None,
-        parallel_mode: Optional[str] = None,
-        parameters_split: Optional[Union[Tuple[str, ...], Dict[str, int]]] = None,
-        device: Union[torch.device, str] = "cuda",
-        ub_overlap_rs: bool = False,
-        ub_overlap_ag: bool = False,
-        ub_name: Optional[str] = None,
-        ep_group: Optional[dist_group_type] = None,
-        moe_alltoall_overlap: Optional[bool] = None,
-    ) -> None:
-        super().__init__()
-
-        params_dtype = torch.get_default_dtype() if params_dtype is None else params_dtype
-        self.in_features = in_features
-        self.out_features = out_features
-        self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
-        self.use_bias = bias
-        self.return_bias = return_bias
-        self.apply_bias = bias and not return_bias
-        self.ub_overlap_rs = ub_overlap_rs
-        self.ub_overlap_ag = ub_overlap_ag
-        if ub_overlap_rs or ub_overlap_ag:
-            assert ub_name is not None, "Userbuffer name [string] is not set."
-        self.ub_name = ub_name
-        self.get_rng_state_tracker = get_rng_state_tracker
-        self.rng_tracker_name = rng_tracker_name
-
-        if device == "meta":
-            assert parameters_split is None, "Cannot split module parameters on 'meta' device."
-        if tp_group is None:
-            self.tp_size = tp_size
-            if tp_size == 1:
-                self.set_tensor_parallel_group(tp_group)
-        else:
-            self.tp_size = get_distributed_world_size(tp_group)
-            self.set_tensor_parallel_group(tp_group)
-        self.set_nccl_overlap_warning_if_tp()
-
-        if ep_group is not None:
-            self.ep_group = ep_group
-            self.ep_size = get_distributed_world_size(ep_group)
-            self.moe_alltoall_overlap = moe_alltoall_overlap
-            # (TODO:) ep_initialized?
-        else:
-            self.moe_alltoall_overlap = False
-
-
-        self.parallel_mode = parallel_mode
-        assert (
-            self.parallel_mode in GemmParallelModes
-        ), f"parallel_mode {parallel_mode} not supported"
-
-        if self.parallel_mode == "column":
-            self.out_features = divide(self.out_features, self.tp_size)
-        elif self.parallel_mode == "row":
-            self.in_features = divide(self.in_features, self.tp_size)
-
-        self.sequence_parallel = (self.tp_size > 1) and sequence_parallel
-
-        # Initialize params in FP8
-        with_fp8_params = FP8GlobalStateManager.with_fp8_parameters()
-
-        # Contiguous buffers for params
-        weight_tensor = torch.empty(
-            self.out_features,
-            self.in_features,
-            device=device,
-            dtype=params_dtype,
-        )
-        bias_tensor = None
-        if self.use_bias:
-            bias_tensor = torch.empty(
-                self.out_features,
-                device=device,
-                dtype=params_dtype,
-            )
-
-        # Configure parameter splits
-        self.weight_names = []
-        self.bias_names = []
-        self.parameter_split_sizes = []
-        if parameters_split is None:
-            # Split into a single parameter by default
-            self.weight_names = ["weight"]
-            self.bias_names = ["bias"]
-            self.parameter_split_sizes = [out_features]
-        elif not parameters_split:
-            raise ValueError("Cannot split weight buffer into 0 parameters")
-        elif isinstance(parameters_split, dict):
-            # Split parameters with provided sizes
-            for name, split_size in parameters_split.items():
-                self.weight_names.append(f"{name.rstrip('_')}_weight")
-                self.bias_names.append(f"{name.rstrip('_')}_bias")
-                self.parameter_split_sizes.append(split_size)
-        elif all(isinstance(name, str) for name in parameters_split):
-            # Split parameters evenly
-            split_size = out_features // len(parameters_split)
-            for name in parameters_split:
-                self.weight_names.append(f"{name.rstrip('_')}_weight")
-                self.bias_names.append(f"{name.rstrip('_')}_bias")
-                self.parameter_split_sizes.append(split_size)
-        else:
-            raise TypeError("Invalid configuration for parameters split")
-
-        # Make sure parameter splits are valid
-        if sum(self.parameter_split_sizes) != out_features:
-            raise ValueError(
-                f"Trying to split weight buffer ({out_features=}) "
-                f"with split sizes {self.parameter_split_sizes}"
-            )
-
-        # Adjust parameter splits for tensor-parallel distribution
-        if self.parallel_mode == "column":
-            for i, size in enumerate(self.parameter_split_sizes):
-                if size % self.tp_size != 0:
-                    raise RuntimeError(
-                        f"Attempting to distribute a parameter with out_features={size} "
-                        f"between {self.tp_size} tensor-parallel processes"
-                    )
-                self.parameter_split_sizes[i] = size // self.tp_size
-
-        # Construct weight parameters
-        # Note: Register weights together so that they are adjacent to
-        # each other in Linear.parameters(). This makes it more likely
-        # that they will stay contiguous if the weights are
-        # manipulated externally, e.g. by FSDP.
-        offset = 0
-        for i, split_size in enumerate(self.parameter_split_sizes):
-            split_start = offset
-            offset += split_size
-            split_end = offset
-
-            # Check if parameters are subviews of buffers
-            is_subview = (split_start, split_end) != (0, self.out_features)
-            if is_subview and with_fp8_params:
-                raise RuntimeError("Splitting Float8Tensor into multiple params is not supported")
-
-            # Construct weight parameter
-            self.register_parameter(
-                self.weight_names[i],
-                torch.nn.Parameter(weight_tensor[split_start:split_end]),
-                init_fn=init_method,
-                get_rng_state_tracker=get_rng_state_tracker,
-                fp8_meta_index=tex.FP8FwdTensors.GEMM1_WEIGHT,
-            )
-
-        # Construct bias parameters if needed
-        if self.use_bias:
-            offset = 0
-            for i, split_size in enumerate(self.parameter_split_sizes):
-                split_start = offset
-                offset += split_size
-                split_end = offset
-                self.register_parameter(
-                    self.bias_names[i],
-                    torch.nn.Parameter(bias_tensor[split_start:split_end]),
-                    init_fn=init_method_constant(0.0),
-                )
-        else:
-            for name in self.bias_names:
-                bias = torch.Tensor().to(dtype=params_dtype, device=device)
-                setattr(self, name, bias)
-
-        if with_fp8_params:
-            self.init_fp8_metadata()
-
-        self.reset_parameters(defer_init=(device == "meta"))
-
-        # For RPL, bias has to be added after TP collectives
-        # So it cannot be fused with the GEMM
-        if self.parallel_mode == "row" and self.apply_bias:
-            self.gemm_bias_unfused_add = True
-        else:
-            self.gemm_bias_unfused_add = False
-
-    def reset_parameters(self, defer_init=False):
-        super().reset_parameters(defer_init=defer_init)
-
-        if not defer_init:
-            # Set parallelism attributes for linear weights
-            for weight in self.weight_names:
-                set_tensor_model_parallel_attributes(
-                    tensor=getattr(self, weight),
-                    is_parallel=True,
-                    dim=1 if self.parallel_mode == "row" else 0,
-                    stride=1,
-                )
-
-            # Set parallelism attributes for linear biases
-            if self.use_bias:
-                for bias in self.bias_names:
-                    if self.parallel_mode == "row":
-                        setattr(getattr(self, bias), "sequence_parallel", self.sequence_parallel)
-                    elif self.parallel_mode == "column":
-                        set_tensor_model_parallel_attributes(getattr(self, bias), True, 0, 1)
-
-    @no_torch_dynamo()
-    def forward(
-        self,
-        inp: torch.Tensor,
-        is_first_microbatch: Optional[bool] = None,
-        fp8_output: Optional[bool] = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
-        """
-        Apply the linear transformation to the input.
-
-        Parameters
-        ----------
-        inp : torch.Tensor
-             Input tensor.
-        is_first_microbatch : {True, False, None}, default = None
-                             During training using either gradient accumulation or
-                             pipeline parallelism a minibatch of data is further split
-                             into microbatches. Between the microbatches of the same minibatch
-                             the model weights are not updated. Setting this parameter indicates
-                             whether the current microbatch is the first in a minibatch or not.
-                             When set, this parameter enables additional optimizations:
-
-                             * during FP8 training, it allows caching of the FP8 versions of
-                               the weights
-                             * it also allows skipping gradient accumulation during the
-                               first microbatch (since it is the first gradient being
-                               produced)
-        """
-
-        skip_fp8_weight_update = FP8GlobalStateManager.get_skip_fp8_weight_update_tensor()
-        if skip_fp8_weight_update is not None:
-            is_first_microbatch = False
-
-        with self.prepare_forward(
-            inp,
-            is_first_microbatch,
-            allow_non_contiguous=isinstance(inp, QuantizedTensor),
-        ) as inp:
-
-            # Get concatenated weight and bias tensors
-            unfused_weights = [getattr(self, name) for name in self.weight_names]
-            if any(isinstance(w, QuantizedTensor) for w in unfused_weights):
-                if self.fp8:
-                    if len(unfused_weights) != 1:
-                        raise RuntimeError(
-                            "Splitting QuantizedTensor into multiple params is not supported"
-                        )
-                else:
-                    unfused_weights = [w.dequantize() for w in unfused_weights]
-            weight_tensor = _noop_cat(unfused_weights)
-            if self.use_bias:
-                bias_tensor = _noop_cat(
-                    [getattr(self, name) for name in self.bias_names],
-                )
-            else:
-                bias_tensor = getattr(self, self.bias_names[0])  # Unused
-
-            # Initialize FP8 weights if needed
-            weight_fp8 = None
-            if self.fp8:
-                if isinstance(weight_tensor, Float8Tensor):
-                    # Make sure transpose cache is valid, if present
-                    # Note: Transpose cache may have been invalidated
-                    # externally, e.g. by optimizer.
-                    if weight_tensor._transpose is not None:
-                        weight_tensor.transpose_2d(
-                            fill_cache=True,
-                            noop_flag=skip_fp8_weight_update,
-                        )
-                else:
-                    # FP8 cast to workspace buffer
-                    update_workspace = is_first_microbatch is None or is_first_microbatch
-                    weight_fp8 = self.get_fp8_workspace(
-                        tensor=weight_tensor,
-                        fp8_meta_forward=True,
-                        fp8_meta_index=tex.FP8FwdTensors.GEMM1_WEIGHT,
-                        cache_name=(None if is_first_microbatch is None else "weight"),
-                        update_workspace=update_workspace,
-                        skip_update_flag=skip_fp8_weight_update,
-                        fsdp_group=self.fsdp_group,
-                    )
-
-            from ..cpu_offload import CPUOffloadEnabled
-
-            if torch.is_grad_enabled():
-                linear_fn = _Linear.apply if not self.moe_alltoall_overlap else _A2ALinear.apply
-                args = []
-            else:
-                linear_fn = _Linear.forward if not self.moe_alltoall_overlap else _A2ALinear.forward
-                args = [None]
-            args += (
-                weight_tensor,
-                weight_fp8,
-                inp,
-                bias_tensor,
-                self.apply_bias and not self.gemm_bias_unfused_add,
-                is_first_microbatch,
-                self.fp8,
-                self.fp8_calibration,
-                self.fp8_meta,
-                self.fuse_wgrad_accumulation,
-                CPUOffloadEnabled,
-                self.tp_group,
-                self.tp_size,
-                self.sequence_parallel,
-                self.tp_size > 1,
-                self.activation_dtype,
-                self.parallel_mode,
-                torch.is_grad_enabled(),
-                self.ub_overlap_rs,
-                self.ub_overlap_ag,
-                self.ub_name,
-                fp8_output,
-                self.fsdp_group,
-            )
-            if self.moe_alltoall_overlap:
-                args +=(
-                    self.ep_group,
-                    self.ep_size,
-                    self.moe_alltoall_overlap
-                )
-            out = linear_fn(*args)
-
-        if self.gemm_bias_unfused_add:
-            out = out + cast_if_needed(bias_tensor, self.activation_dtype)
-
-        if self.return_bias:
-            return out, cast_if_needed(bias_tensor, self.activation_dtype)
-        return out

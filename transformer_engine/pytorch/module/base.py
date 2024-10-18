@@ -86,6 +86,7 @@ def initialize_ub(
     dtype: torch.dtype = torch.bfloat16,
     ub_cfgs: Optional[dict] = None,
     bootstrap_backend: Union[str, torch.distributed.Backend] = None,
+    ep_factor: Optional[int] = None,
 ) -> None:
     """Initialize communicators for TP comm overlap using userbuffers."""
     if not tex.device_supports_multicast():
@@ -302,9 +303,13 @@ def initialize_ub(
             else:
                 if atomic_gemm and method == "ring_exchange":
                     assert rs_ag_pairs[name] in layers_atomic_ring_exchange, assert_message
+        if ep_factor is not None:
+            ep_shape = shape[0] * ep_factor + shape[1:]
+        else:
+            ep_shape = shape
 
         sample_buffer = torch.empty(
-            shape, dtype=torch.uint8 if (use_fp8 and fp8_buf) else dtype, device="cuda"
+            ep_shape, dtype=torch.uint8 if (use_fp8 and fp8_buf) else dtype, device="cuda"
         )
         if method == "ring_exchange":
             ub_obj = tex.UbufP2PCommOverlap(
