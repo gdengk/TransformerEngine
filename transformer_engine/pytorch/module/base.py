@@ -303,14 +303,20 @@ def initialize_ub(
             else:
                 if atomic_gemm and method == "ring_exchange":
                     assert rs_ag_pairs[name] in layers_atomic_ring_exchange, assert_message
-        if ep_factor is not None:
-            ep_shape = shape[0] * ep_factor + shape[1:]
+        
+        # (TODO) when A2A is on top of this, the ub size will change accordingly
+        # but need to passin more informathion into this structure
+        ep_gemms = name == 'fc1_fprop' or name == 'fc2_fprop' or name == 'fc2_dgrad'
+        if ep_factor is not None and ep_gemms:
+            ep_shape = list(shape)
+            ep_shape[0] = ep_shape[0]*ep_factor
         else:
             ep_shape = shape
 
         sample_buffer = torch.empty(
             ep_shape, dtype=torch.uint8 if (use_fp8 and fp8_buf) else dtype, device="cuda"
         )
+
         if method == "ring_exchange":
             ub_obj = tex.UbufP2PCommOverlap(
                 sample_buffer,  # Sample userbuffer
@@ -795,6 +801,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                     out=grad_output_c,
                 )
             else:
+                # Isn't this a ub copy?
                 grad_output_c = grad_output_mat
             if not ctx.ub_overlap_ag:
                 grad_output_c, _ = gather_along_first_dim(grad_output_c, ctx.tp_group)

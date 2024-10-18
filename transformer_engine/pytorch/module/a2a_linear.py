@@ -113,11 +113,25 @@ class _A2ALinear(torch.autograd.Function):
 
         ## end of debug cmds
 
+        # get ub bufname:
+        if ub_overlap_ag or ub_overlap_rs:
+            ub_obj = get_ub(ub_name + "_fprop")
+        else:
+            ub_obj = None
+
 
         if moe_alltoall_overlap and ep_size!=1 and not a2a_ag_overlap and parallel_mode=='column':
             # A2A communication - evenly distributed
+            # (TODO) if not using UB here, save this inputmat as output tensor
+            if ub_overlap_ag:
+                # for bf16 high precisoin, the output will be directly from a2a out.
+                # otherwise this will be downcast to the ubuf[0] as the output
+                a2a_out = ub_obj.get_ubuf_output(0)
+            else:
+                a2a_out = None
+
             inputmat, _ = alltoall(
-                None, # don't assign output for now
+                a2a_out, # don't assign output for now
                 inputmat,
                 None, #input_splits for now
                 None, #output_splits for now
@@ -127,6 +141,7 @@ class _A2ALinear(torch.autograd.Function):
 
 
         # Cast input to expected dtype
+        #(TODO: guard something here to avoid conversion on ub version inputmat )
         inputmat = cast_if_needed(inputmat, activation_dtype)
         inputmat_t = None
         inputmat_no_fp8 = inputmat
@@ -181,9 +196,8 @@ class _A2ALinear(torch.autograd.Function):
                 # (TODO: Gao) support fp8 later. Here this `not fp8` is inappropriate
                 dim_size = list(inputmat.size())
                 dim_size[0] = dim_size[0] * tp_world_size
-                ub_obj_gemmin = get_ub(ub_name + "_fprop")
-                inputmat_total = ub_obj_gemmin.get_ubuf_output(1)
-                gemm_in = ub_obj_gemmin.get_ubuf_output(0)
+                inputmat_total = ub_obj.get_ubuf_output(1)
+                # gemm_in = ub_obj.get_ubuf_output(0)
             else:
                 inputmat_total, _ = gather_along_first_dim(inputmat, tp_group)
         else:
@@ -214,28 +228,27 @@ class _A2ALinear(torch.autograd.Function):
                 )
 
             if ub_overlap_rs:
-                ub_obj_projout = get_ub(ub_name + "_fprop")
-                out = ub_obj_projout.get_ubuf_output(1)
+                out = ub_obj.get_ubuf_output(1)
                 dim_size = list(inputmat_total.size())
                 dim_size[0] = dim_size[0] // tp_world_size
                 dim_size[1] = weight_fp8.size(0)
                 rs_out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
-                if ub_obj_projout.is_p2p_overlap():
-                    if ub_obj_projout.is_atomic_gemm():
+                if ub_obj.is_p2p_overlap():
+                    if ub_obj.is_atomic_gemm():
                         ub_algo = tex.UbufOverlapAlgo.ATOMIC_GEMM_RS_P2P
                     else:
                         ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS_P2P
                 else:
-                    if ub_obj_projout.is_atomic_gemm():
+                    if ub_obj.is_atomic_gemm():
                         ub_algo = tex.UbufOverlapAlgo.ATOMIC_GEMM_RS
                     else:
                         ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS
-                if ub_obj_projout.is_fp8_ubuf():
+                if ub_obj.is_fp8_ubuf():
                     proj_out_index = tex.FP8FwdTensors.GEMM1_OUTPUT
                     meta_tensor = fp8_meta["scaling_fwd"]
                     proj_out_tetype = fp8_dtype_forward
                     proj_out_pttype = torch.uint8
-                    ub_obj_projout.set_ubuf_scale_inv(meta_tensor.scale_inv[proj_out_index])
+                    ub_obj.set_ubuf_scale_inv(meta_tensor.scale_inv[proj_out_index])
             else:
                 dim_size = list(inputmat_total.size())
                 dim_size[1] = weight_fp8.size(0)
@@ -261,7 +274,7 @@ class _A2ALinear(torch.autograd.Function):
                 use_split_accumulator=_2X_ACC_FPROP,
                 out=out,
                 ub_algo=ub_algo if ub_overlap_rs else None,
-                ub=ub_obj_projout if ub_overlap_rs else None,
+                ub=ub_obj if ub_overlap_rs else None,
                 extra_output_tensor=rs_out if ub_overlap_rs else None,
                 out_index=proj_out_index,
                 fp8_meta_tensor=meta_tensor,
@@ -281,6 +294,8 @@ class _A2ALinear(torch.autograd.Function):
             weight = cast_if_needed(weight, activation_dtype)
             bias = cast_if_needed(bias, activation_dtype) if use_bias else bias
 
+            # (TODO) remove this later
+            assert not fp8_calibration, "fp8_calibration must be false in tmp run"
             if fp8_calibration:
                 # amax of input
                 amin, amax = inputmat_total.aminmax()
@@ -294,18 +309,15 @@ class _A2ALinear(torch.autograd.Function):
                 ).float()
 
             ub_algo = None
-            ub_obj = None
             extra_output_tensor = None
             if ub_overlap_rs and parallel_mode == "row":
-                ub_obj_projout = get_ub(ub_name + "_fprop")
-                ub_obj = ub_obj_projout
-                out = ub_obj_projout.get_ubuf_output(1)
+                out = ub_obj.get_ubuf_output(1)
                 dim_size = list(inputmat_total.size())
                 dim_size[0] = dim_size[0] // get_distributed_world_size(tp_group)
                 dim_size[1] = weight.size(0)
                 rs_out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
                 extra_output_tensor = rs_out
-                if ub_obj_projout.is_p2p_overlap():
+                if ub_obj.is_p2p_overlap():
                     ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS_P2P
                 else:
                     ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS
@@ -315,13 +327,12 @@ class _A2ALinear(torch.autograd.Function):
                 out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
 
             if ub_overlap_ag and parallel_mode == "column":
-                ub_obj = ub_obj_gemmin
-                if ub_obj_gemmin.is_atomic_gemm():
+                if ub_obj.is_atomic_gemm():
                     ub_algo = tex.UbufOverlapAlgo.ATOMIC_GEMM_AG_P2P
                 else:
-                    ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG_P2P
-                
-                extra_output_tensor = torch.empty_like(gemm_in)
+                    ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG_P2P    
+                extra_output_tensor = torch.empty_like(inputmat)
+                inputmat_no_fp8 = extra_output_tensor
 
             
             _ = gemm(
@@ -390,7 +401,7 @@ class _A2ALinear(torch.autograd.Function):
             ctx.inp_shape = inp.shape
             ctx.parallel_mode = parallel_mode
             ctx.tp_group = tp_group
-            ctx.ub_overlap_ag = ub_overlap_ag
+            ctx.ub_overlap_ag = ub_overlap_ag and (parallel_mode == "row")
             ctx.ub_name = ub_name
             ctx.tp_size = tp_size
             ctx.requires_dgrad = inp.requires_grad
@@ -594,10 +605,6 @@ class _A2ALinear(torch.autograd.Function):
                         ),
                         ub=ctx.ub_obj_gradout if ctx.ub_overlap_ag else None,
                     )
-                    if parallel_mode=="row":
-                        torch.distributed.barrier()
-                        print(f"Gao after barrier rank={torch.distributed.get_rank()} mean={torch.mean(out)} var={torch.var(out)} sequence_parallel{sequence_parallel}")
-                        exit()
 
                 # Overlap dgrad-RS/AR with wgrad
                 if ctx.parallel_mode == "column" and ctx.sequence_parallel:
