@@ -726,6 +726,7 @@ class Linear(TransformerEngineBaseModule):
         ub_name: Optional[str] = None,
         ep_group: Optional[dist_group_type] = None,
         moe_alltoall_overlap: Optional[bool] = None,
+        moe_ring_exchange: Optional[bool] = None,
     ) -> None:
         super().__init__()
 
@@ -759,9 +760,11 @@ class Linear(TransformerEngineBaseModule):
             self.ep_group = ep_group
             self.ep_size = get_distributed_world_size(ep_group)
             self.moe_alltoall_overlap = moe_alltoall_overlap
+            self.moe_ring_exchange = moe_ring_exchange
             # (TODO:) ep_initialized?
         else:
             self.moe_alltoall_overlap = False
+            self.moe_ring_exchange = False
 
 
         self.parallel_mode = parallel_mode
@@ -780,7 +783,7 @@ class Linear(TransformerEngineBaseModule):
         with_fp8_params = FP8GlobalStateManager.with_fp8_parameters()
 
         # Contiguous buffers for params
-        weight_tensor = torch.empty(
+        weight_tensor = torch.ones(
             self.out_features,
             self.in_features,
             device=device,
@@ -1032,7 +1035,8 @@ class Linear(TransformerEngineBaseModule):
                 args +=(
                     self.ep_group,
                     self.ep_size,
-                    self.moe_alltoall_overlap
+                    self.moe_alltoall_overlap,
+                    self.moe_ring_exchange
                 )
             out = linear_fn(*args)
 
