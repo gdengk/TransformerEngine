@@ -115,8 +115,7 @@ def a2a_p2p_with_step(step, send_tensor, recv_tensor, process_group, batch_p2p_c
     return send_recv_reqs
 
 
-def ring_exchange_overlap(
-        a2a_first,
+def ring_exchange_overlap_ag(
         weight,
         input,
         activation_dtype,
@@ -227,7 +226,6 @@ def ring_exchange_overlap(
                 else:
                     tp_reqs = []
                 
-                assert torch.all(comm_buf[src_comm_buf_i]==1), f'input has to be one {src_comm_buf_i}'
                 _ = gemm(
                     weight,
                     comm_buf[src_comm_buf_i],
@@ -251,11 +249,118 @@ def ring_exchange_overlap(
     # (TODO) we might have a way to get rid of this D2D and make it async
     # comm_buf_offset = tp_local_rank * ep_chunksize
     # comm_buf[ep_local_rank + comm_buf_offset].copy_(chunked_input[ep_local_rank])
-    dim_size = comm_buf[0].size()[0]
+    dim_size = comm_buf[0].size(0)
     a2a_out = tmp_buf[comm_buf_offset * dim_size: (comm_buf_offset+ep_chunksize)*dim_size]
 
     return out, a2a_out
 
+
+def ring_exchange_overlap_rs(
+        weight,
+        input,
+        activation_dtype,
+        out, # likely not need it,
+        ub_algo,
+        ub_obj,
+        extra_output_tensor,
+        ep_aggregate2,
+        tp_aggregate2,
+        ep_group,
+        ep_size,
+        tp_group,
+        tp_size,
+):
+    batch_p2p_comm = True
+
+    ep_local_rank =  torch.distributed.get_rank(ep_group) if ep_size!=1 else None
+    tp_local_rank =  torch.distributed.get_rank(tp_group) if tp_size!=1 else None
+
+     # disable aggregate2 when no tp/ep group
+    ep_aggregate2 = False if ep_size == 1 else ep_aggregate2
+    tp_aggregate2 = False if tp_size == 1 else tp_aggregate2
+
+    ep_chunksize = ep_size//2 if ep_aggregate2 else ep_size
+    tp_chunksize = tp_size//2 if tp_aggregate2 else tp_size
+
+    ep_reqs = []
+    tp_reqs = []
+
+    # two streams for now
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+
+    chunked_input = torch.chunk(input, chunks=ep_size*tp_size, dim=0)
+    # a2a output
+    chunked_out = torch.chunk(out, chunks=ep_size, dim=0)        
+    tmp_buf = torch.empty(out.size(0) * tp_size, out.size(1), dtype = out.dtype, device = out.device )
+    comm_buf = torch.chunk(tmp_buf, chunks=ep_size * tp_size, dim=0)
+    assert chunked_out[0].size(0) == comm_buf[0].size(0), "the output size must match"
+
+    assert ub_obj is None, "ring_exchange_overlap does not support UB for now"
+    assert extra_output_tensor is None, 'ring_exchange_overlap does not support extra_output_tensor from UB'
+
+
+    cublasworkspace = get_multi_stream_cublas_workspace()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for s in streams:
+        s.wait_stream(torch.cuda.current_stream())
+
+    for i in range(ep_chunksize):
+        cur_ep_i = (ep_local_rank+i+1)%ep_size
+        dst_ep_i = (ep_local_rank-i-1+ep_size)%ep_size
+
+
+        tp_reduce_list = []
+        for j in range(tp_chunksize):
+            streamid = (i*tp_chunksize + j)%2
+            cur_tp_i = (tp_local_rank+j+1)%tp_size
+            dst_tp_i = (tp_local_rank-j-1+tp_size)%tp_size
+            
+            with torch.cuda.stream(streams[streamid]):
+
+                # gemm first and then do the
+                rs_src_i = cur_tp_i*ep_size + cur_ep_i
+                dst_comm_i = ep_size * dst_tp_i + cur_ep_i
+                
+                if j != tp_chunksize - 1:
+                    gemm_out = torch.empty_like(chunked_out[0])
+                else:
+                    gemm_out = comm_buf[rs_src_i]
+
+                _ = gemm(
+                    weight,
+                    chunked_input[rs_src_i],
+                    activation_dtype,
+                    cublasworkspace[streamid],
+                    out=gemm_out,
+                    ub_algo=ub_algo,
+                    ub=ub_obj,
+                    extra_output_tensor= extra_output_tensor,
+                    )
+                
+                if j < tp_chunksize -1:
+                    reqs = a2a_p2p_with_step(j+1, gemm_out, comm_buf[dst_comm_i], tp_group, batch_p2p_comm)
+                    tp_reqs.extend(reqs)
+                tp_reduce_list.append(comm_buf[dst_comm_i])
+
+                if j == tp_chunksize-1:
+                    # data reduce and launch A2A communication
+                    for req in tp_reqs:
+                        req.wait()
+                    tp_reqs = []
+                    rs_out = torch.sum(torch.stack(tp_reduce_list), dim=0)
+                    if i < ep_chunksize -1:
+                        reqs = a2a_p2p_with_step(i+1, rs_out, chunked_out[dst_ep_i], ep_group, batch_p2p_comm)
+                        ep_reqs.extend(reqs)
+                    else:
+                        chunked_out[dst_ep_i].copy_(rs_out)
+
+                        for req in ep_reqs:
+                            req.wait()
+    
+    for s in streams:
+        torch.cuda.current_stream().wait_stream(s)
+
+    return out
 
 
 
@@ -313,7 +418,7 @@ class _A2ALinear(torch.autograd.Function):
         #(TODO: Gao for debug) some control commands
         # here moe_alltoall_overlap means move a2a and ag into TE side, does not necessarily means they are going to be overlap
         a2a_ag_overlap = moe_ring_exchange # column mode
-        rs_a2a_overlap = False #moe_ring_exchange # row mode
+        rs_a2a_overlap = moe_ring_exchange #moe_ring_exchange # row mode
 
         #Fake cmd to control TP UB overlap:
         # ub_overlap_ag = True
@@ -536,6 +641,8 @@ class _A2ALinear(torch.autograd.Function):
                 dim_size[1] = weight.size(0)
                 if a2a_ag_overlap and parallel_mode == "column":
                     dim_size[0] = dim_size[0] * tp_size
+                elif rs_a2a_overlap and parallel_mode == "row":
+                    dim_size[0] = dim_size[0] // tp_size
                 out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
 
 
@@ -548,8 +655,23 @@ class _A2ALinear(torch.autograd.Function):
                 inputmat_no_fp8 = extra_output_tensor
 
             if a2a_ag_overlap and parallel_mode == "column":
-                _ , inputmat_no_fp8 = ring_exchange_overlap(
-                    a2a_first= (parallel_mode == "column"),
+                _ , inputmat_no_fp8 = ring_exchange_overlap_ag(
+                    weight=weight,
+                    input=inputmat_total,
+                    activation_dtype=activation_dtype,
+                    out=out,
+                    ub_algo=ub_algo,
+                    ub_obj=ub_obj,
+                    extra_output_tensor=extra_output_tensor,
+                    ep_aggregate2=False,
+                    tp_aggregate2=False,
+                    ep_group=ep_group,
+                    ep_size=ep_size,
+                    tp_group=tp_group,
+                    tp_size=tp_size,
+                )
+            elif rs_a2a_overlap and parallel_mode == "row":
+                _ = ring_exchange_overlap_rs(
                     weight=weight,
                     input=inputmat_total,
                     activation_dtype=activation_dtype,
@@ -647,20 +769,16 @@ class _A2ALinear(torch.autograd.Function):
             ctx.moe_alltoall_overlap = moe_alltoall_overlap
             ctx.moe_ring_exchange = moe_ring_exchange
 
-
-        # if parallel_mode=="row":
-        #     torch.distributed.barrier()
-        #     print(f"Gao after barrier rank={torch.distributed.get_rank()} mean={torch.mean(out)} var={torch.var(out)} sequence_parallel{sequence_parallel}")
-        #     exit()
         
         # Row Parallel Linear
-        if ub_overlap_rs and parallel_mode == "row":
-            out = rs_out
-        elif parallel_mode == "row" and sequence_parallel:
-            # no ub based overlap
-            out, _ = reduce_scatter_along_first_dim(out, tp_group)
-        elif parallel_mode == "row" and tensor_parallel:
-            out, _ = allreduce(out, tp_group)
+        if not rs_a2a_overlap:
+            if ub_overlap_rs and parallel_mode == "row":
+                out = rs_out
+            elif parallel_mode == "row" and sequence_parallel:
+                # no ub based overlap
+                out, _ = reduce_scatter_along_first_dim(out, tp_group)
+            elif parallel_mode == "row" and tensor_parallel:
+                out, _ = allreduce(out, tp_group)
 
         
 
