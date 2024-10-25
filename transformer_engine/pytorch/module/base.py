@@ -86,7 +86,7 @@ def initialize_ub(
     dtype: torch.dtype = torch.bfloat16,
     ub_cfgs: Optional[dict] = None,
     bootstrap_backend: Union[str, torch.distributed.Backend] = None,
-    ep_factor: Optional[int] = None,
+    ep_factor: Optional[float] = None,
 ) -> None:
     """Initialize communicators for TP comm overlap using userbuffers."""
     if not tex.device_supports_multicast():
@@ -223,8 +223,8 @@ def initialize_ub(
     dgrad_reduce_scatter_overlap = ["qkv_dgrad", "fc1_dgrad"]
     # Default overlap methods for layers
     methods = {
-        "ring_exchange": ["qkv_fprop", "fc1_fprop", "proj_dgrad", "fc2_dgrad"],
-        "pipeline": ["proj_fprop", "fc2_fprop"],
+        "ring_exchange": ["qkv_fprop", "fc1_fprop", "proj_dgrad", "fc2_dgrad", "fc2_fprop"],
+        "pipeline": ["proj_fprop", ],
         "bulk": ["qkv_dgrad", "qkv_wgrad", "fc1_dgrad", "fc1_wgrad"],
     }
 
@@ -309,7 +309,7 @@ def initialize_ub(
         ep_gemms = name == 'fc1_fprop' or name == 'fc2_fprop' or name == 'fc2_dgrad'
         if ep_factor is not None and ep_gemms:
             ep_shape = list(shape)
-            ep_shape[0] = ep_shape[0]*ep_factor
+            ep_shape[0] = int(ep_shape[0]*ep_factor)
         else:
             ep_shape = shape
 
@@ -762,7 +762,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         else:
             grad_output = grad_output.contiguous()
         grad_output_mat = grad_output.view(-1, grad_output.shape[-1])
-        gather_grad_output = row_parallel_mode and ctx.sequence_parallel
+        gather_grad_output = row_parallel_mode and ctx.sequence_parallel and not ctx.a2a_ag_overlap
 
         # No-FP8 case: bgrad is fused with wgrad for this case.
         if not ctx.fp8:
