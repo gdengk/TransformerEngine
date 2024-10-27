@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 import torch
 
 import transformer_engine_torch as tex
+import os
 
 from .base import (
     get_workspace,
@@ -54,6 +55,53 @@ from ..tensor import QuantizedTensor
 import math
 
 __all__ = ["_A2ALinear"]
+
+
+def get_send_recv_ops(
+    reverse_order,
+    send_tensor,
+    send_dst,
+    recv_tensor,
+    recv_src,
+    process_group,
+    batch_p2p_comm,
+):
+    send_recv_ops = []
+    if not reverse_order:
+        send_op = (
+            torch.distributed.P2POp(
+                torch.distributed.isend, send_tensor, send_dst, process_group
+            )
+            if batch_p2p_comm
+            else torch.distributed.isend(send_tensor, send_dst, process_group)
+        )
+        recv_op = (
+            torch.distributed.P2POp(
+                torch.distributed.irecv, recv_tensor, recv_src, process_group
+            )
+            if batch_p2p_comm
+            else torch.distributed.irecv(recv_tensor, recv_src, process_group)
+        )
+        send_recv_ops.append(send_op)
+        send_recv_ops.append(recv_op)
+    else:
+        recv_op = (
+            torch.distributed.P2POp(
+                torch.distributed.irecv, recv_tensor, recv_src, process_group
+            )
+            if batch_p2p_comm
+            else torch.distributed.irecv(recv_tensor, recv_src, process_group)
+        )
+        send_op = (
+            torch.distributed.P2POp(
+                torch.distributed.isend, send_tensor, send_dst, process_group
+            )
+            if batch_p2p_comm
+            else torch.distributed.isend(send_tensor, send_dst, process_group)
+        )
+        send_recv_ops.append(recv_op)
+        send_recv_ops.append(send_op)
+    return send_recv_ops
 
 
 def a2a_p2p_with_step(step, send_tensor, recv_tensor, process_group, batch_p2p_comm):
@@ -113,6 +161,115 @@ def a2a_p2p_with_step(step, send_tensor, recv_tensor, process_group, batch_p2p_c
     return send_recv_reqs
 
 
+def multi_step_p2p(
+    step_list,
+    send_tensor_list,
+    recv_tensor_list,
+    sub_pg_size,
+    process_group,
+    batch_p2p_comm,
+):
+
+    local_rank = torch.distributed.get_rank(process_group)
+    sub_pg_offset = local_rank // sub_pg_size
+    sub_pg_rank = local_rank % sub_pg_size
+
+    all_send_recv_ops = []
+
+    for step, send_tensor, recv_tensor in zip(
+        step_list, send_tensor_list, recv_tensor_list
+    ):
+        gcd = math.gcd(sub_pg_size, step)
+        reverse_order = (sub_pg_rank // gcd) % 2 == 1
+        send_dst = torch.distributed.get_global_rank(
+            process_group,
+            sub_pg_offset * sub_pg_size
+            + (sub_pg_rank + step + sub_pg_size) % sub_pg_size,
+        )
+        recv_src = torch.distributed.get_global_rank(
+            process_group,
+            sub_pg_offset * sub_pg_size
+            + (sub_pg_rank - step + sub_pg_size) % sub_pg_size,
+        )
+
+        all_send_recv_ops.extend(
+            get_send_recv_ops(
+                reverse_order,
+                send_tensor,
+                send_dst,
+                recv_tensor,
+                recv_src,
+                process_group,
+                batch_p2p_comm,
+            )
+        )
+
+    if batch_p2p_comm:
+        send_recv_reqs = torch.distributed.batch_isend_irecv(all_send_recv_ops)
+    else:
+        send_recv_reqs = all_send_recv_ops
+    return send_recv_reqs
+
+
+def aggregate_p2p(
+    step,
+    chunked_input,
+    comm_buf,
+    aggregate_size,
+    comm_buf_nonag_offset,
+    process_group,
+    batch_p2p_comm,
+):
+    pg_world_size = torch.distributed.get_world_size(process_group)
+    local_rank = torch.distributed.get_rank(process_group)
+
+    chunk_idx = local_rank // aggregate_size
+    sub_chunk_rank = local_rank % aggregate_size
+    chunk_size = pg_world_size // aggregate_size
+
+    # send data to num of aggregate_size destinations
+    send_recv_ops = []
+
+    dst_chunk_idx = (chunk_idx + step) % chunk_size
+    src_chunk_idx = (chunk_idx - step + chunk_size) % chunk_size
+
+    gcd = math.gcd(chunk_size, step)
+    reverse_order = (chunk_idx // gcd) % 2 == 1
+
+    for i in range(aggregate_size):
+
+        dst_rank = (
+            dst_chunk_idx * aggregate_size + (i + sub_chunk_rank) % aggregate_size
+        )
+        src_rank = (
+            src_chunk_idx * aggregate_size
+            + (sub_chunk_rank - i + aggregate_size) % aggregate_size
+        )
+
+        send_tensor = chunked_input[dst_rank]
+        send_dst = torch.distributed.get_global_rank(process_group, dst_rank)
+        recv_tensor = comm_buf[src_rank + comm_buf_nonag_offset]
+        recv_src = torch.distributed.get_global_rank(process_group, src_rank)
+
+        send_recv_ops.extend(
+            get_send_recv_ops(
+                reverse_order,
+                send_tensor,
+                send_dst,
+                recv_tensor,
+                recv_src,
+                process_group,
+                batch_p2p_comm,
+            )
+        )
+
+    if batch_p2p_comm:
+        send_recv_reqs = torch.distributed.batch_isend_irecv(send_recv_ops)
+    else:
+        send_recv_reqs = send_recv_ops
+    return send_recv_reqs
+
+
 def ring_exchange_overlap_ag(
     weight,
     input,
@@ -122,7 +279,7 @@ def ring_exchange_overlap_ag(
     ub_obj,
     extra_output_tensor,
     ep_aggregate2,
-    tp_aggregate2,
+    tp_aggregate2,  # ag aggregate will affect data ordering
     ep_group,
     ep_size,
     tp_group,
@@ -270,6 +427,182 @@ def ring_exchange_overlap_ag(
     dim_size = comm_buf[0].size(0)
     a2a_out = tmp_buf[
         comm_buf_offset * dim_size : (comm_buf_offset + ep_chunksize) * dim_size
+    ]
+
+    return out, a2a_out
+
+
+def ring_exchange_overlap_ag_aggregate(
+    weight,
+    input,
+    activation_dtype,
+    out,  # likely not need it,
+    ub_algo,
+    ub_obj,
+    extra_output_tensor,
+    ep_aggregate,
+    tp_aggregate,  # ag aggregate will affect data ordering
+    ep_group,
+    ep_size,
+    tp_group,
+    tp_size,
+    layout="TN",
+    grad=False,
+):
+    # multistream ring exchange
+    # disable a2a+ag outside this loop
+    # disable rs+ag outside this loop
+
+    # expose this later
+    batch_p2p_comm = True
+
+    ep_local_rank = torch.distributed.get_rank(ep_group) if ep_size != 1 else 0
+    tp_local_rank = torch.distributed.get_rank(tp_group) if tp_size != 1 else 0
+
+    # disable aggregate2 when no tp/ep group
+    if ep_aggregate is None or ep_size == 1:
+        ep_aggregate = 1
+
+    # assert ep_aggregate should be an int and should be at least half of ep_size
+
+    ep_chunksize = ep_size // ep_aggregate
+    # tp_chunksize = tp_size // 2 if tp_aggregate2 else tp_size
+    tp_chunksize = tp_size
+    assert tp_aggregate is None, "Don't supoort tp_aggregate for now"
+
+    ep_reqs = []
+    tp_reqs = []
+
+    # two streams for now
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+
+    # chunk input as view:
+    chunked_input = torch.chunk(input, chunks=ep_size, dim=0)
+    # consider ag only at this time
+    comm_full_buf = torch.empty(
+        (input.shape[0] * tp_size),
+        input.shape[1],
+        dtype=input.dtype,
+        device=input.device,
+    )
+    comm_buf_ag_view = torch.chunk(
+        comm_full_buf, chunks=ep_chunksize * tp_chunksize, dim=0
+    )
+    comm_buf_nonag_view = torch.chunk(comm_full_buf, chunks=ep_size * tp_size, dim=0)
+    # must assign out
+    assert out is not None, "must assign out before ring_exchange_overlap function"
+    chunked_out = torch.chunk(out, chunks=ep_chunksize * tp_chunksize, dim=0)
+    assert ub_obj is None, "ring_exchange_overlap does not support UB for now"
+    assert (
+        extra_output_tensor is None
+    ), "ring_exchange_overlap does not support extra_output_tensor from UB"
+
+    # make sure it copied:
+    comm_buf_nonag_offset = tp_local_rank * ep_size
+    comm_buf_ag_offset = tp_local_rank * ep_chunksize
+
+    ep_chunk_idx = ep_local_rank // ep_aggregate
+
+    cublasworkspace = get_multi_stream_cublas_workspace()
+
+    for s in streams:
+        s.wait_stream(torch.cuda.current_stream())
+
+    # preprocess aggregate input
+    if ep_aggregate > 1:
+        sub_pg_offset = ep_chunk_idx * ep_aggregate
+        sub_pg_rank = ep_local_rank % ep_aggregate
+        preprocess_step_list = list(range(1, ep_aggregate))
+        preprocess_send_tensor_list = []
+        preprocess_recv_tensor_list = []
+        for i in preprocess_step_list:
+            sub_send_src_rank = sub_pg_offset + (sub_pg_rank + i) % ep_aggregate
+            sub_recv_dst_rank = (
+                sub_pg_offset + (sub_pg_rank - i + ep_aggregate) % ep_aggregate
+            )
+            preprocess_send_tensor_list.append(chunked_input[sub_send_src_rank])
+            preprocess_recv_tensor_list.append(
+                comm_buf_nonag_view[sub_recv_dst_rank + comm_buf_nonag_offset]
+            )
+
+        ep_reqs = multi_step_p2p(
+            preprocess_step_list,
+            preprocess_send_tensor_list,
+            preprocess_recv_tensor_list,
+            ep_aggregate,
+            ep_group,
+            batch_p2p_comm,
+        )
+
+    # local D2D into buf
+    comm_buf_nonag_view[ep_local_rank + comm_buf_nonag_offset].copy_(
+        chunked_input[ep_local_rank]
+    )
+
+    for i in range(ep_chunksize):
+        cur_ep_i = (ep_chunk_idx - i + ep_chunksize) % ep_chunksize
+        for j in range(tp_chunksize):
+            streamid = (i * tp_chunksize + j) % 2
+            with torch.cuda.stream(streams[streamid]):
+                if j == 0:
+                    # data dependency check before starting AG
+                    for req in ep_reqs:
+                        req.wait()
+
+                    # launch the a2a before AG starts
+                    if i < ep_chunksize - 1:
+                        aggregate_p2p(
+                            i + 1,
+                            chunked_input,
+                            comm_buf_nonag_view,
+                            ep_aggregate,
+                            comm_buf_nonag_offset,
+                            ep_group,
+                            batch_p2p_comm,
+                        )
+
+                # tp comm starts
+                for req in tp_reqs:
+                    req.wait()
+
+                cur_tp_i = (tp_local_rank - j + tp_size) % tp_size
+                dst_tp_i = (tp_local_rank - j - 1 + tp_size) % tp_size
+                src_comm_buf_i = cur_tp_i * ep_chunksize + cur_ep_i
+                if j < tp_chunksize - 1:
+                    dst_comm_buf_i = dst_tp_i * ep_chunksize + cur_ep_i
+                    tp_reqs = a2a_p2p_with_step(
+                        1,
+                        comm_buf_ag_view[src_comm_buf_i],
+                        comm_buf_ag_view[dst_comm_buf_i],
+                        tp_group,
+                        batch_p2p_comm,
+                    )
+                else:
+                    tp_reqs = []
+
+                _ = gemm(
+                    weight,
+                    comm_buf_ag_view[src_comm_buf_i],
+                    activation_dtype,
+                    cublasworkspace[streamid],
+                    out=chunked_out[src_comm_buf_i],
+                    ub_algo=ub_algo,
+                    ub=ub_obj,
+                    extra_output_tensor=extra_output_tensor,
+                    layout=layout,
+                    grad=grad,
+                )
+
+                # in the last loop, tp_dst_i keep the same as prev value but not used.
+                # tp_in = comm_buf[dst_comm_buf_i]
+
+    for s in streams:
+        torch.cuda.current_stream().wait_stream(s)
+
+    # (TODO): Can we make async D2D
+    dim_size = comm_buf_nonag_view[0].size(0)
+    a2a_out = comm_full_buf[
+        comm_buf_nonag_offset * dim_size : (comm_buf_nonag_offset + ep_size) * dim_size
     ]
 
     return out, a2a_out
@@ -526,7 +859,7 @@ def rs_a2a_bulk_overlap_gemm_bak1(
     return wgrad, grad_bias, rs_out
 
 
-def rs_a2a_bulk_overlap_gemm(
+def rs_a2a_bulk_overlap_gemm_bak2(
     weight,
     input,
     activation_dtype,
@@ -625,6 +958,114 @@ def rs_a2a_bulk_overlap_gemm(
     else:
         rs_out = torch.cat(a2a_output, dim=1)
 
+    return wgrad, grad_bias, rs_out
+
+
+def rs_a2a_bulk_overlap_gemm(
+    weight,
+    input,
+    activation_dtype,
+    ep_group,
+    ep_size,
+    tp_group,
+    tp_size,
+    layout="TN",
+    grad=False,
+    rs_in=None,
+    accumulate_wgrad_into_param_main_grad=False,
+    out=None,
+):
+
+    streams = [torch.cuda.Stream(), torch.cuda.Stream(), torch.cuda.Stream()]
+
+    if tp_size == 1 or ep_size == 1:
+        chunk_size = 1
+        chunked_rs_in = [rs_in]
+    else:
+        chunk_size = 2
+        chunked_rs_in = list(torch.chunk(rs_in, chunks=chunk_size, dim=1))
+        # original_sm = os.environ['NVTE_EXT_MARGIN_SM'] if 'NVTE_EXT_MARGIN_SM' in os.environ else '0'
+        # os.environ['NVTE_EXT_MARGIN_SM'] = '24'
+    a2a_output = [
+        torch.empty(
+            rs_in.size(0) // tp_size,
+            rs_in.size(1) // chunk_size,
+            dtype=rs_in.dtype,
+            device=rs_in.device,
+        )
+        for _ in range(chunk_size)
+    ]
+    a2a_in = [
+        torch.empty(
+            rs_in.size(0) // tp_size,
+            rs_in.size(1) // chunk_size,
+            dtype=rs_in.dtype,
+            device=rs_in.device,
+        )
+        for _ in range(chunk_size)
+    ]
+
+    rs_handles = []
+    a2a_handles = []
+
+    for s in streams:
+        s.wait_stream(torch.cuda.current_stream())
+
+    with torch.cuda.stream(streams[2]):
+        wgrad, grad_bias, _ = gemm(
+            weight,
+            input,
+            activation_dtype,
+            get_workspace(),
+            layout=layout,
+            grad=grad,
+            use_bias=False,
+            accumulate=accumulate_wgrad_into_param_main_grad,
+            out=out,
+        )
+
+    for i in range(chunk_size):
+        with torch.cuda.stream(streams[0]):
+            if tp_size != 1:
+                rs_handle = torch.distributed._reduce_scatter_base(
+                    a2a_in[i],
+                    chunked_rs_in[i].contiguous(),
+                    group=tp_group,
+                    async_op=True,
+                )
+                rs_handles.append(rs_handle)
+                if i + 1 < chunk_size:
+                    chunked_rs_in[i + 1] = chunked_rs_in[i + 1].contiguous()
+
+            else:
+                a2a_in[i] = rs_in
+                rs_handles = []
+
+        with torch.cuda.stream(streams[1]):
+            if ep_size != 1:
+                if len(rs_handles) != 0:
+                    rs_handles[i].wait()
+                a2a_handle = torch.distributed.all_to_all_single(
+                    a2a_output[i], a2a_in[i], None, None, ep_group, async_op=True,
+                )
+                a2a_handles.append(a2a_handle)
+            else:
+                a2a_output[0] = a2a_in[0]
+                a2a_handles = rs_handles
+
+    for a2a_handle in a2a_handles:
+        a2a_handle.wait()
+
+    for s in streams:
+        torch.cuda.current_stream().wait_stream(s)
+
+    if tp_size == 1 or ep_size == 1:
+        rs_out = a2a_output[0]
+    else:
+        rs_out = torch.cat(a2a_output, dim=1)
+
+    # if tp_size != 1 and ep_size != 1:
+    #     os.environ['NVTE_EXT_MARGIN_SM'] = original_sm
     return wgrad, grad_bias, rs_out
 
 
@@ -935,7 +1376,8 @@ class _A2ALinear(torch.autograd.Function):
                 inputmat_no_fp8 = extra_output_tensor
 
             if a2a_ag_overlap and parallel_mode == "column":
-                _, inputmat_no_fp8 = ring_exchange_overlap_ag(
+                # ring_exchange_overlap_ag_aggregate
+                _, inputmat_no_fp8 = ring_exchange_overlap_ag_aggregate(
                     weight=weight,
                     input=inputmat_total,
                     activation_dtype=activation_dtype,
@@ -943,8 +1385,8 @@ class _A2ALinear(torch.autograd.Function):
                     ub_algo=ub_algo,
                     ub_obj=ub_obj,
                     extra_output_tensor=extra_output_tensor,
-                    ep_aggregate2=False,
-                    tp_aggregate2=False,
+                    ep_aggregate=1,
+                    tp_aggregate=None,
                     ep_group=ep_group,
                     ep_size=ep_size,
                     tp_group=tp_group,
