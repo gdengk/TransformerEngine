@@ -747,7 +747,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
     @staticmethod
     def grad_output_preprocess(
-        ctx, grad_output: torch.Tensor, row_parallel_mode: bool
+        ctx, grad_output: torch.Tensor, row_parallel_mode: bool, a2a_ag_overlap: bool=False
     ) -> Tuple[Union[torch.Tensor, None], ...]:
         """Utility function for backward.
         Returns tuple in order (all optional/None based on training precion/recipe):
@@ -762,7 +762,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         else:
             grad_output = grad_output.contiguous()
         grad_output_mat = grad_output.view(-1, grad_output.shape[-1])
-        gather_grad_output = row_parallel_mode and ctx.sequence_parallel and not ctx.a2a_ag_overlap
+        gather_grad_output = row_parallel_mode and ctx.sequence_parallel and not a2a_ag_overlap
 
         # No-FP8 case: bgrad is fused with wgrad for this case.
         if not ctx.fp8:

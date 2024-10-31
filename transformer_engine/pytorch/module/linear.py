@@ -725,6 +725,7 @@ class Linear(TransformerEngineBaseModule):
         ub_overlap_ag: bool = False,
         ub_name: Optional[str] = None,
         ep_group: Optional[dist_group_type] = None,
+        ep_size: int = 1,
         moe_alltoall_overlap: Optional[bool] = None,
         moe_ring_exchange: Optional[bool] = None,
         moe_pipeline_split: Optional[bool] = None,
@@ -756,18 +757,17 @@ class Linear(TransformerEngineBaseModule):
             self.tp_size = get_distributed_world_size(tp_group)
             self.set_tensor_parallel_group(tp_group)
         self.set_nccl_overlap_warning_if_tp()
-
+        
         if ep_group is not None:
             self.ep_group = ep_group
             self.ep_size = get_distributed_world_size(ep_group)
-            self.moe_alltoall_overlap = moe_alltoall_overlap
-            self.moe_ring_exchange = moe_ring_exchange
-            self.moe_pipeline_split = moe_pipeline_split
-            # (TODO:) ep_initialized?
         else:
-            self.moe_alltoall_overlap = False
-            self.moe_ring_exchange = False
-            self.moe_pipeline_split = False
+            self.ep_size = ep_size
+        self.moe_alltoall_overlap = moe_alltoall_overlap
+        self.moe_ring_exchange = moe_ring_exchange
+        self.moe_pipeline_split = moe_pipeline_split
+            # (TODO:) ep_initialized?
+        
 
 
         self.parallel_mode = parallel_mode
@@ -897,7 +897,10 @@ class Linear(TransformerEngineBaseModule):
             self.gemm_bias_unfused_add = True
         else:
             self.gemm_bias_unfused_add = False
-
+    
+    def set_expert_parallel_group(self, ep_group: Union[dist_group_type, None]):
+        self.ep_group=ep_group
+    
     def reset_parameters(self, defer_init=False):
         super().reset_parameters(defer_init=defer_init)
 
@@ -1009,6 +1012,7 @@ class Linear(TransformerEngineBaseModule):
             else:
                 linear_fn = _Linear.forward if not self.moe_alltoall_overlap else _A2ALinear.forward
                 args = [None]
+            
             args += (
                 weight_tensor,
                 weight_fp8,

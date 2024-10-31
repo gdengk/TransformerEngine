@@ -2015,7 +2015,7 @@ class _A2ALinear(torch.autograd.Function):
                 grad_output_t,
                 grad_bias,
             ) = TransformerEngineBaseModule.grad_output_preprocess(
-                ctx, grad_output, ctx.parallel_mode == "row"
+                ctx, grad_output, ctx.parallel_mode == "row", a2a_ag_overlap=ctx.a2a_ag_overlap
             )
 
             # Column Parallel Linear
