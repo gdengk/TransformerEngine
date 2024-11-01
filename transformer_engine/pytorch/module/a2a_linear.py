@@ -336,6 +336,7 @@ def ring_exchange_overlap_ag(
 
     cublasworkspace = get_multi_stream_cublas_workspace()
 
+
     for s in streams:
         s.wait_stream(torch.cuda.current_stream())
 
@@ -417,7 +418,6 @@ def ring_exchange_overlap_ag(
 
     for s in streams:
         torch.cuda.current_stream().wait_stream(s)
-
     # (TODO): if needs grad
     # need to hide this D2D with gemm
     # copy current data to coresponding buf
@@ -428,8 +428,9 @@ def ring_exchange_overlap_ag(
     a2a_out = tmp_buf[
         comm_buf_offset * dim_size : (comm_buf_offset + ep_chunksize) * dim_size
     ]
+    ag_out = tmp_buf
 
-    return out, a2a_out
+    return out, a2a_out, ag_out
 
 
 def ring_exchange_overlap_ag_aggregate(
@@ -453,6 +454,7 @@ def ring_exchange_overlap_ag_aggregate(
     # disable a2a+ag outside this loop
     # disable rs+ag outside this loop
 
+    
     # expose this later
     batch_p2p_comm = True
 
@@ -551,7 +553,7 @@ def ring_exchange_overlap_ag_aggregate(
 
                     # launch the a2a before AG starts
                     if i < ep_chunksize - 1:
-                        aggregate_p2p(
+                        ep_reqs = aggregate_p2p(
                             i + 1,
                             chunked_input,
                             comm_buf_nonag_view,
@@ -605,7 +607,7 @@ def ring_exchange_overlap_ag_aggregate(
         comm_buf_nonag_offset * dim_size : (comm_buf_nonag_offset + ep_size) * dim_size
     ]
 
-    return out, a2a_out
+    return out, a2a_out, comm_full_buf
 
 
 def ring_exchange_overlap_rs(
@@ -639,9 +641,14 @@ def ring_exchange_overlap_rs(
     else:
         chunked_out = torch.chunk(out, chunks=ep_size, dim=0)
 
-    rs_out = [torch.empty_like(chunked_out[0]) for _ in range(ep_size - 1)]
+    # rs_out = [torch.empty_like(chunked_out[0]) for _ in range(ep_size - 1)]
+    rs_out_fullbuf = torch.empty((chunked_out[0].size(0)*ep_size, chunked_out[0].size(1)), dtype=chunked_out[0].dtype, device=chunked_out[0].device)
+    rs_out = torch.chunk(rs_out_fullbuf, chunks=ep_size, dim=0)
 
     cublasworkspace = get_workspace()
+
+    gemm_in_array = [torch.cat(chunked_input[i::ep_size], dim=0) for i in range(ep_size) ]
+
 
     for i in range(ep_chunksize):
         cur_ep_i = (ep_local_rank + i + 1) % ep_size
@@ -650,7 +657,7 @@ def ring_exchange_overlap_rs(
         if i == ep_chunksize - 1:
             gemm_rs_out = chunked_out[dst_ep_i]
         else:
-            gemm_rs_out = rs_out[i]
+            gemm_rs_out = rs_out[cur_ep_i]
         if tp_size == 1:
             gemm_out = gemm_rs_out
             gemm_extra_output_tensor = None
@@ -658,26 +665,24 @@ def ring_exchange_overlap_rs(
             gemm_out = ub_obj.get_ubuf_output(1)
             gemm_extra_output_tensor = gemm_rs_out
 
-        gemm_in = torch.cat(chunked_input[cur_ep_i::ep_size], dim=0)
+        # gemm_in = torch.cat(chunked_input[cur_ep_i::ep_size], dim=0)
         _ = gemm(
             weight,
-            gemm_in,
+            gemm_in_array[cur_ep_i],
             activation_dtype,
-            cublasworkspace,
+            get_workspace(),
             out=gemm_out,
             ub_algo=ub_algo,
             ub=ub_obj,
             extra_output_tensor=gemm_extra_output_tensor,
         )
 
+        for req in ep_reqs:
+            req.wait()
         if i < ep_chunksize - 1:
-            reqs = a2a_p2p_with_step(
-                i + 1, rs_out[i], chunked_out[dst_ep_i], ep_group, batch_p2p_comm
+            ep_reqs = a2a_p2p_with_step(
+                i + 1, rs_out[cur_ep_i], chunked_out[dst_ep_i], ep_group, batch_p2p_comm
             )
-            ep_reqs.extend(reqs)
-
-    for req in ep_reqs:
-        req.wait()
 
     return extra_output_tensor
 
@@ -1101,9 +1106,19 @@ def pipeline_split_ag(
 
     # start the real algorithm here
     chunked_input = torch.chunk(input, chunks=num_pipeline_stage, dim=0)
-    a2a_full_buf = torch.empty_like(input)
-    a2a_out = torch.chunk(a2a_full_buf, chunks=num_pipeline_stage, dim=0)
-    ag_out = [ torch.empty((chunked_input[0].size(0)*tp_size, chunked_input[0].size(1)), dtype=input.dtype, device=input.device ) for _ in range(num_pipeline_stage)]
+    if ep_size!=1:
+        a2a_full_buf = torch.empty_like(input)
+        a2a_out = torch.chunk(a2a_full_buf, chunks=num_pipeline_stage, dim=0)
+    else:
+        a2a_full_buf = input
+        a2a_out = chunked_input
+    # ag_out = [ torch.empty((chunked_input[0].size(0)*tp_size, chunked_input[0].size(1)), dtype=input.dtype, device=input.device ) for _ in range(num_pipeline_stage)]
+    if tp_size!=1:
+        ag_out_full_tensor = torch.empty((input.size(0)*tp_size, input.size(1)), dtype=input.dtype, device=input.device)
+        ag_out = torch.chunk(ag_out_full_tensor, chunks=num_pipeline_stage, dim=0)
+    else:
+        ag_out_full_tensor = a2a_full_buf
+        ag_out = a2a_out
     out_tmp = torch.empty_like(out)
     chunked_output = torch.chunk(out_tmp, chunks=num_pipeline_stage, dim=0)
 
@@ -1132,16 +1147,12 @@ def pipeline_split_ag(
                     a2a_handles[i%2] = torch.distributed.all_to_all_single(
                         a2a_out[i], chunked_input[i], None, None, ep_group, async_op=True,
                     )
-                else:
-                    a2a_out[i] = chunked_input[i]
             
             if ag_handles[(i+1)%2] is not None:
                 ag_handles[(i+1)%2].wait()
             if i > 0 and i < num_pipeline_stage+1:
                 if tp_size!=1:
                     ag_handles[i%2] = torch.distributed._all_gather_base(ag_out[i-1], a2a_out[i-1], group=tp_group, async_op = True)
-                else:
-                    ag_out[i-1] = a2a_out[i-1]
             
             if i > extra_stage-1:
                 _ = gemm(
@@ -1167,7 +1178,9 @@ def pipeline_split_ag(
     out.copy_(out_tmp.contiguous())
 
     a2a_out_reshape = a2a_full_buf.reshape((num_pipeline_stage, ep_size, -1 ,input.size(1))).permute([1,0,2,3]).reshape([-1,input.size(1)]).contiguous()
-    return out, a2a_out_reshape
+    ag_out_reshape = ag_out_full_tensor.reshape((num_pipeline_stage, tp_size, ep_size, -1 ,input.size(1))).permute([2,0,1,3,4]).reshape([-1,input.size(1)]).contiguous()
+    
+    return out, a2a_out_reshape, ag_out_reshape
     
 
 
@@ -1498,9 +1511,17 @@ class _A2ALinear(torch.autograd.Function):
         # (TODO: Gao for debug) some control commands
         # here moe_alltoall_overlap means move a2a and ag into TE side, does not necessarily means they are going to be overlap
         assert (not moe_ring_exchange) or (not moe_pipeline_split), "moe_ring_exchange and moe_pipeline_split could not both be true" 
-        a2a_ag_overlap = moe_ring_exchange or moe_pipeline_split  # column mode
-        rs_a2a_overlap = moe_ring_exchange or moe_pipeline_split # row mode
+        a2a_ag_overlap = (moe_ring_exchange or moe_pipeline_split) and (parallel_mode == "column")  # column mode
+        # rs_a2a_overlap = (moe_ring_exchange or moe_pipeline_split) and (parallel_mode == "row") # row mode
+        rs_a2a_overlap = moe_pipeline_split and (parallel_mode == "row") # row mode
         num_pipeline_stage = 4
+        ep_aggregate_size = 2
+
+        # rs_a2a_overlap = False
+        # ub_overlap_rs = False
+
+        # a2a_ag_overlap=False
+        # ub_overlap_ag=False
 
         if a2a_ag_overlap:
             # turn ub off since a2a_ag does not support it
@@ -1508,7 +1529,7 @@ class _A2ALinear(torch.autograd.Function):
         if moe_pipeline_split:
             ub_overlap_rs = False
         ## end of debug cmds
-
+        
         # get ub bufname:
         if (ub_overlap_ag and parallel_mode == "column") or (
             ub_overlap_rs and parallel_mode == "row"
@@ -1755,7 +1776,7 @@ class _A2ALinear(torch.autograd.Function):
 
             if a2a_ag_overlap and parallel_mode == "column":
                 if moe_ring_exchange:
-                    _, inputmat_no_fp8 = ring_exchange_overlap_ag_aggregate(
+                    _, inputmat_no_fp8, _ = ring_exchange_overlap_ag_aggregate(
                         weight=weight,
                         input=inputmat_total,
                         activation_dtype=activation_dtype,
@@ -1763,15 +1784,16 @@ class _A2ALinear(torch.autograd.Function):
                         ub_algo=ub_algo,
                         ub_obj=ub_obj,
                         extra_output_tensor=extra_output_tensor,
-                        ep_aggregate=4,
+                        ep_aggregate=ep_aggregate_size,
                         tp_aggregate=None,
                         ep_group=ep_group,
                         ep_size=ep_size,
                         tp_group=tp_group,
                         tp_size=tp_size,
                     )
+                    
                 elif moe_pipeline_split:
-                    _, inputmat_no_fp8 = pipeline_split_ag(
+                    _, inputmat_no_fp8,_ = pipeline_split_ag(
                         weight=weight,
                         input=inputmat_total,
                         activation_dtype=activation_dtype,
@@ -1910,6 +1932,7 @@ class _A2ALinear(torch.autograd.Function):
             ctx.moe_ring_exchange = moe_ring_exchange
             ctx.moe_pipeline_split = moe_pipeline_split
             ctx.num_pipeline_stage = num_pipeline_stage
+            ctx.ep_aggregate_size=ep_aggregate_size
 
         # Row Parallel Linear
         if ub_overlap_rs and parallel_mode == "row":
@@ -1925,6 +1948,7 @@ class _A2ALinear(torch.autograd.Function):
         if parallel_mode == "row" and moe_alltoall_overlap and not rs_a2a_overlap:
             if ep_size != 1:
                 out, _ = alltoall(None, out, None, None, ep_group, False,)
+        
 
         # [*, in_features] -> [*, out_features] except first dimension changes for S
         return out.view(-1, *inp.shape[1:-1], out.shape[-1])
@@ -1935,9 +1959,12 @@ class _A2ALinear(torch.autograd.Function):
     ) -> Tuple[Union[torch.Tensor, None], ...]:
 
         # (TODO: Gao) my backward control port:
-        rs_a2a_overlap = False
-        a2a_ag_overlap = ctx.moe_ring_exchange or ctx.moe_pipeline_split
-        ctx.a2a_ag_overlap = a2a_ag_overlap
+        # ctx.moe_ring_exchange = False
+        # ctx.ub_overlap_ag = False
+
+        a2a_ag_overlap = (ctx.moe_ring_exchange or ctx.moe_pipeline_split) and (ctx.parallel_mode == "row")
+        if a2a_ag_overlap:
+            ctx.ub_overlap_ag = False
         rs_a2a_bulk_overlap = True
         rs_a2a_bulk_overlap = (
             rs_a2a_bulk_overlap
@@ -1946,7 +1973,7 @@ class _A2ALinear(torch.autograd.Function):
         )
 
         # end of debug control session
-
+        
         if isinstance(grad_output, Float8Tensor):
             ctx.fp8_meta["scaling_bwd"].scale_inv[
                 tex.FP8BwdTensors.GRAD_OUTPUT1
@@ -2015,7 +2042,7 @@ class _A2ALinear(torch.autograd.Function):
                 grad_output_t,
                 grad_bias,
             ) = TransformerEngineBaseModule.grad_output_preprocess(
-                ctx, grad_output, ctx.parallel_mode == "row", a2a_ag_overlap=ctx.a2a_ag_overlap
+                ctx, grad_output, ctx.parallel_mode == "row", a2a_ag_overlap=a2a_ag_overlap
             )
 
             # Column Parallel Linear
@@ -2095,15 +2122,14 @@ class _A2ALinear(torch.autograd.Function):
                             dtype=ctx.activation_dtype,
                         )
                 else:
-                    if ctx.a2a_ag_overlap and ctx.parallel_mode == "row":
-
+                    if a2a_ag_overlap and ctx.parallel_mode == "row":
                         dgrad = torch.empty(
                             (grad_output.size(0) * ctx.tp_size, weight.size(1)),
                             dtype=ctx.activation_dtype,
                             device=grad_output.device,
                         )
                         if ctx.moe_ring_exchange:
-                            _, _ = ring_exchange_overlap_ag(
+                            _, _, grad_output = ring_exchange_overlap_ag_aggregate(
                                 weight=weight,
                                 input=grad_output,
                                 activation_dtype=ctx.activation_dtype,
@@ -2111,8 +2137,8 @@ class _A2ALinear(torch.autograd.Function):
                                 ub_algo=None,
                                 ub_obj=None,
                                 extra_output_tensor=None,
-                                ep_aggregate2=False,
-                                tp_aggregate2=False,
+                                ep_aggregate=ctx.ep_aggregate_size,
+                                tp_aggregate=None,
                                 ep_group=ctx.ep_group,
                                 ep_size=ctx.ep_size,
                                 tp_group=ctx.tp_group,
@@ -2121,7 +2147,7 @@ class _A2ALinear(torch.autograd.Function):
                                 grad=True,
                             )
                         elif ctx.moe_pipeline_split:
-                            _, _ = pipeline_split_ag(
+                            _, _, grad_output = pipeline_split_ag(
                                 weight=weight,
                                 input=grad_output,
                                 activation_dtype=ctx.activation_dtype,
@@ -2176,7 +2202,6 @@ class _A2ALinear(torch.autograd.Function):
                             ),
                             ub=ctx.ub_obj_gradout if ctx.ub_overlap_ag else None,
                         )
-
                 # Overlap dgrad-RS/AR with wgrad
                 if ctx.parallel_mode == "column" and ctx.sequence_parallel:
                     if handle is not None:
@@ -2189,7 +2214,6 @@ class _A2ALinear(torch.autograd.Function):
                         handle = None
                 elif ctx.parallel_mode == "column" and ctx.tensor_parallel:
                     dgrad, handle = allreduce(dgrad, ctx.tp_group, async_op=True)
-
             if weight.requires_grad:
                 if ctx.fp8:
                     # WGRAD
@@ -2298,7 +2322,8 @@ class _A2ALinear(torch.autograd.Function):
                 # Deallocate input tensor
                 clear_tensor_data(inputmat_total)
                 clear_tensor_data(inputmat_t_total)
-
+            
+            
             # Column Parallel Linear
             if (
                 ctx.parallel_mode == "column"
@@ -2311,7 +2336,6 @@ class _A2ALinear(torch.autograd.Function):
             if (
                 ctx.parallel_mode == "column"
                 and ctx.moe_alltoall_overlap
-                and not rs_a2a_overlap
                 and not rs_a2a_bulk_overlap
             ):
                 if ctx.ep_size != 1:
@@ -2354,7 +2378,6 @@ class _A2ALinear(torch.autograd.Function):
 
         if ctx.reduce_and_update_bwd_fp8_tensors and not is_graph_capturing():
             FP8GlobalStateManager.reduce_and_update_fp8_tensors(forward=False)
-
         # Scatter fp8 weight buffers
         if ctx.fp8 and not isinstance(weight, Float8Tensor):
             _fsdp_scatter_tensors(ctx.fsdp_group, weight_fp8)

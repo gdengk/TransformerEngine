@@ -786,7 +786,7 @@ class Linear(TransformerEngineBaseModule):
         with_fp8_params = FP8GlobalStateManager.with_fp8_parameters()
 
         # Contiguous buffers for params
-        weight_tensor = torch.ones(
+        weight_tensor = torch.empty(
             self.out_features,
             self.in_features,
             device=device,
