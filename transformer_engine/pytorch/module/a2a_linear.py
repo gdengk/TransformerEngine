@@ -1101,8 +1101,8 @@ def pipeline_split_ag(
     #  - we should offset this in reduce scatter
     # but since this is the first function. I will just keep it
     # input in the order of EP, covert to [num_split_stage, EP, etc]
-    dim1 = input.size(1)
-    input = input.reshape((ep_size, num_pipeline_stage, -1, dim1)).permute((1,0, 2, 3)).reshape((-1, dim1)).contiguous()
+    # dim1 = input.size(1)
+    # input = input.reshape((ep_size, num_pipeline_stage, -1, dim1)).permute((1,0, 2, 3)).reshape((-1, dim1)).contiguous()
 
     # done with the new input. Permutation should done this for me
 
@@ -1121,8 +1121,8 @@ def pipeline_split_ag(
     else:
         ag_out_full_tensor = a2a_full_buf
         ag_out = a2a_out
-    out_tmp = torch.empty_like(out)
-    chunked_output = torch.chunk(out_tmp, chunks=num_pipeline_stage, dim=0)
+    # out_tmp = torch.empty_like(out)
+    chunked_output = torch.chunk(out, chunks=num_pipeline_stage, dim=0)
 
 
     cublasworkspace = get_multi_stream_cublas_workspace()
@@ -1176,11 +1176,13 @@ def pipeline_split_ag(
     # get the right e2e group for backward calcualtion
     # a few things to be reordered to pass accuracy check
     dim1 = out.size(1)
-    out_tmp = out_tmp.reshape((num_pipeline_stage, tp_size, ep_size, -1, dim1)).permute([1,2,0,3,4]).reshape((-1,dim1))
-    out.copy_(out_tmp.contiguous())
+    # out_tmp = out_tmp.reshape((num_pipeline_stage, tp_size, ep_size, -1, dim1)).permute([1,2,0,3,4]).reshape((-1,dim1))
+    # out.copy_(out_tmp.contiguous())
 
-    a2a_out_reshape = a2a_full_buf.reshape((num_pipeline_stage, ep_size, -1 ,input.size(1))).permute([1,0,2,3]).reshape([-1,input.size(1)]).contiguous()
-    ag_out_reshape = ag_out_full_tensor.reshape((num_pipeline_stage, tp_size, ep_size, -1 ,input.size(1))).permute([2,0,1,3,4]).reshape([-1,input.size(1)]).contiguous()
+    # a2a_out_reshape = a2a_full_buf.reshape((num_pipeline_stage, ep_size, -1 ,input.size(1))).permute([1,0,2,3]).reshape([-1,input.size(1)]).contiguous()
+    a2a_out_reshape = a2a_full_buf
+    # ag_out_reshape = ag_out_full_tensor.reshape((num_pipeline_stage, tp_size, ep_size, -1 ,input.size(1))).permute([2,0,1,3,4]).reshape([-1,input.size(1)]).contiguous()
+    ag_out_reshape = ag_out_full_tensor
     
     return out, a2a_out_reshape, ag_out_reshape
     
@@ -1202,18 +1204,28 @@ def pipeline_split_rs(
 ):
     
     # start with datashuffle as needed
-    dim1 = input.size(1)
-    input = input.reshape((tp_size, ep_size, num_pipeline_stage, -1, dim1)).permute((2,0,1,3,4)).reshape((-1, dim1)).contiguous()
+    # dim1 = input.size(1)
+    # input = input.reshape((tp_size, ep_size, num_pipeline_stage, -1, dim1)).permute((2,0,1,3,4)).reshape((-1, dim1)).contiguous()
 
     # Remove this after permutation
     chunked_input = torch.chunk(input, chunks=num_pipeline_stage, dim=0)
-    tmp_gemm_out = torch.empty((input.size(0), out.size(1)), dtype=input.dtype, device = input.device)
-    rs_in = torch.chunk(tmp_gemm_out, chunks=num_pipeline_stage, dim=0)
+    
+    # tmp_out = torch.empty_like(out)
+    a2a_out = list(torch.chunk(out, chunks = num_pipeline_stage, dim=0))
+    if ep_size == 1:
+        tmp_rs_out = out
+        rs_output = a2a_out
+    else:
+        tmp_rs_out = torch.empty_like(out)
+        rs_output = list(torch.chunk(tmp_rs_out, chunks = num_pipeline_stage, dim=0))
+    
+    if tp_size == 1:
+        tmp_gemm_out = tmp_rs_out
+        rs_in = rs_output
+    else:
+        tmp_gemm_out = torch.empty((input.size(0), out.size(1)), dtype=input.dtype, device = input.device)
+        rs_in = torch.chunk(tmp_gemm_out, chunks=num_pipeline_stage, dim=0)
 
-    tmp_out = torch.empty_like(out)
-    a2a_out = list(torch.chunk(tmp_out, chunks = num_pipeline_stage, dim=0))
-    tmp_rs_out = torch.empty_like(out)
-    rs_output = list(torch.chunk(tmp_rs_out, chunks = num_pipeline_stage, dim=0))
 
     cublasworkspace = get_multi_stream_cublas_workspace()
 
@@ -1247,8 +1259,7 @@ def pipeline_split_rs(
             if i < num_pipeline_stage:
                 if tp_size!=1:
                     rs_handles[i%2] = torch.distributed._reduce_scatter_base(rs_output[i], rs_in[i], group=tp_group, async_op=True)
-                else:
-                    rs_output[i] = rs_in[i]
+
 
             if a2a_handles[(i+1)%2] is not None:
                 a2a_handles[(i+1)%2].wait()
@@ -1257,8 +1268,6 @@ def pipeline_split_rs(
                     a2a_handles[i%2] = torch.distributed.all_to_all_single(
                         a2a_out[i-extra_stage], rs_output[i-extra_stage], None, None, ep_group, async_op=True,
                     )
-                else:
-                    a2a_out[i-extra_stage] = rs_output[i-extra_stage]
     
     for handle in a2a_handles + rs_handles:
         if handle is not None:
@@ -1267,11 +1276,11 @@ def pipeline_split_rs(
     for s in streams:
         torch.cuda.current_stream().wait_stream(s)
     
-    dim1 = out.size(1)
-    if ep_size == 1:
-        tmp_out = tmp_rs_out
-    permuted_tmp_out = tmp_out.reshape((num_pipeline_stage, ep_size, -1, dim1)).permute([1,0,2,3]).reshape((-1, dim1))
-    out.copy_(permuted_tmp_out.contiguous())
+    # dim1 = out.size(1)
+    # if ep_size == 1:
+    #     tmp_out = tmp_rs_out
+    # permuted_tmp_out = tmp_out.reshape((num_pipeline_stage, ep_size, -1, dim1)).permute([1,0,2,3]).reshape((-1, dim1))
+    # out.copy_(permuted_tmp_out.contiguous())
 
     return out
 
@@ -1293,8 +1302,8 @@ def pipeline_split_bulk_ag(
     grad=False,
     ag_in=None,        
 ):
-    dim1=ag_in.size(1)
-    ag_in = ag_in.reshape((ep_size, num_pipeline_stage, -1, dim1)).permute([1,0,2,3]).reshape((-1,dim1)).contiguous()
+    # dim1=ag_in.size(1)
+    # ag_in = ag_in.reshape((ep_size, num_pipeline_stage, -1, dim1)).permute([1,0,2,3]).reshape((-1,dim1)).contiguous()
     
     
     
@@ -1337,8 +1346,9 @@ def pipeline_split_bulk_ag(
         torch.cuda.current_stream().wait_stream(s)
     
     # reshape at the end to make everything matched
-    dim1 = ag_out_full_tensor.size(1)
-    ag_out = ag_out_full_tensor.reshape((num_pipeline_stage, tp_size, ep_size, -1, dim1)).permute([1,2,0,3,4]).reshape((-1, dim1)).contiguous()
+    # dim1 = ag_out_full_tensor.size(1)
+    # ag_out = ag_out_full_tensor.reshape((num_pipeline_stage, tp_size, ep_size, -1, dim1)).permute([1,2,0,3,4]).reshape((-1, dim1)).contiguous()
+    ag_out = ag_out_full_tensor
 
 
     return ag_out
@@ -1368,27 +1378,27 @@ def pipeline_split_bulk_rs_a2a(
 ):
     
     
-    dim1 = rs_in.size(1)
-    # remove this later
-    rs_in = rs_in.reshape((tp_size, ep_size, num_pipeline_stage, -1, dim1)).permute((2,0,1,3,4)).reshape((-1, dim1)).contiguous()
+    # dim1 = rs_in.size(1)
+    # # remove this later
+    # rs_in = rs_in.reshape((tp_size, ep_size, num_pipeline_stage, -1, dim1)).permute((2,0,1,3,4)).reshape((-1, dim1)).contiguous()
 
     # prepare input slices
     chunked_rs_in = torch.chunk(rs_in, chunks=num_pipeline_stage, dim=0)
 
-    rs_out = [
-        torch.empty(
-            rs_in.size(0) // (tp_size *num_pipeline_stage),
-            rs_in.size(1) ,
-            dtype=rs_in.dtype,
-            device=rs_in.device,
-        )
-        for _ in range(num_pipeline_stage)
-    ]
+    if tp_size == 1:
+        rs_out = rs_in
+        chunked_rs_out = chunked_rs_in
+    else:
+        rs_out = torch.empty((rs_in.size(0) // tp_size, rs_in.size(1)), dtype=rs_in.dtype, device=rs_in.device,)
+        chunked_rs_out = torch.chunk(rs_out, chunks=num_pipeline_stage, dim=0)
 
-    a2a_output = torch.empty((rs_in.size(0)//tp_size, rs_in.size(1)), dtype=rs_in.dtype, device=rs_in.device)
-    chunked_a2a_output = list(torch.chunk(a2a_output, chunks=num_pipeline_stage, dim=0))
-    rs_out = torch.empty_like(a2a_output)
-    chunked_rs_out = list(torch.chunk(rs_out, chunks=num_pipeline_stage, dim=0))
+    
+    if ep_size == 1:
+        a2a_output = rs_out
+        chunked_a2a_output = chunked_rs_out
+    else:
+        a2a_output = torch.empty((rs_in.size(0)//tp_size, rs_in.size(1)), dtype=rs_in.dtype, device=rs_in.device)
+        chunked_a2a_output = list(torch.chunk(a2a_output, chunks=num_pipeline_stage, dim=0))
 
     streams = [torch.cuda.Stream(), torch.cuda.Stream(), torch.cuda.Stream()]
     rs_handles = []
@@ -1420,9 +1430,7 @@ def pipeline_split_bulk_rs_a2a(
                     async_op=True,
                 )
                 rs_handles.append(rs_handle)
-            else:
-                chunked_rs_out[i] = chunked_rs_in[i]
-                rs_handles = []
+
         
         with torch.cuda.stream(streams[1]):
             if ep_size != 1:
@@ -1432,9 +1440,6 @@ def pipeline_split_bulk_rs_a2a(
                     chunked_a2a_output[i], chunked_rs_out[i], None, None, ep_group, async_op=True,
                 )
                 a2a_handles.append(a2a_handle)
-            else:
-                chunked_a2a_output[0] = chunked_rs_out[0]
-                a2a_handles = rs_handles
     
     for a2a_handle in a2a_handles:
         a2a_handle.wait()
@@ -1443,10 +1448,10 @@ def pipeline_split_bulk_rs_a2a(
         torch.cuda.current_stream().wait_stream(s)
 
     # the memory space might get changed. Be aware
-    if ep_size == 1:
-        a2a_output = rs_out
+    # if ep_size == 1:
+    #     a2a_output = rs_out
     
-    a2a_output = a2a_output.reshape((num_pipeline_stage, ep_size, -1, dim1)).permute([1,0,2,3]).reshape((-1, dim1)).contiguous()
+    # a2a_output = a2a_output.reshape((num_pipeline_stage, ep_size, -1, dim1)).permute([1,0,2,3]).reshape((-1, dim1)).contiguous()
 
     return wgrad, grad_bias, a2a_output
 
@@ -1495,9 +1500,10 @@ class _A2ALinear(torch.autograd.Function):
         moe_alltoall_overlap: bool,
         moe_ring_exchange: bool,
         moe_pipeline_split: bool,
+        moe_num_pipeline_stage: int,
     ) -> torch.Tensor:
         is_input_fp8 = isinstance(inp, Float8Tensor)
-
+        
         # Make sure input dimensions are compatible
         in_features = weight.shape[-1]
         assert inp.shape[-1] == in_features, "GEMM not possible"
@@ -1516,7 +1522,7 @@ class _A2ALinear(torch.autograd.Function):
         a2a_ag_overlap = (moe_ring_exchange or moe_pipeline_split) and (parallel_mode == "column")  # column mode
         # rs_a2a_overlap = (moe_ring_exchange or moe_pipeline_split) and (parallel_mode == "row") # row mode
         rs_a2a_overlap = moe_pipeline_split and (parallel_mode == "row") # row mode
-        num_pipeline_stage = 4
+        num_pipeline_stage = moe_num_pipeline_stage
         ep_aggregate_size = 1
 
         # rs_a2a_overlap = False
@@ -1933,7 +1939,7 @@ class _A2ALinear(torch.autograd.Function):
             ctx.moe_alltoall_overlap = moe_alltoall_overlap
             ctx.moe_ring_exchange = moe_ring_exchange
             ctx.moe_pipeline_split = moe_pipeline_split
-            ctx.num_pipeline_stage = num_pipeline_stage
+            ctx.moe_num_pipeline_stage = moe_num_pipeline_stage
             ctx.ep_aggregate_size=ep_aggregate_size
 
         # Row Parallel Linear
@@ -2157,7 +2163,7 @@ class _A2ALinear(torch.autograd.Function):
                                 ub_algo=None,
                                 ub_obj=None,
                                 extra_output_tensor=None,
-                                num_pipeline_stage=ctx.num_pipeline_stage,
+                                num_pipeline_stage=ctx.moe_num_pipeline_stage,
                                 ep_group=ctx.ep_group,
                                 ep_size=ctx.ep_size,
                                 tp_group=ctx.tp_group,
@@ -2179,7 +2185,7 @@ class _A2ALinear(torch.autograd.Function):
                             ub_algo=None,
                             ub_obj=None,
                             extra_output_tensor=None,
-                            num_pipeline_stage=ctx.num_pipeline_stage,
+                            num_pipeline_stage=ctx.moe_num_pipeline_stage,
                             ep_group=ctx.ep_group,
                             ep_size=ctx.ep_size,
                             tp_group=ctx.tp_group,
@@ -2292,7 +2298,7 @@ class _A2ALinear(torch.autograd.Function):
                                 inputmat_total,
                                 grad_output,
                                 ctx.activation_dtype,
-                                ctx.num_pipeline_stage,
+                                ctx.moe_num_pipeline_stage,
                                 ctx.ep_group,
                                 ctx.ep_size,
                                 ctx.tp_group,
@@ -2412,4 +2418,5 @@ class _A2ALinear(torch.autograd.Function):
             None,  # moe_alltoall_overlap
             None,  # moe_ring_exchange
             None,  # moe_pipeline_split
+            None,  # moe_num_pipeline_stage
         )

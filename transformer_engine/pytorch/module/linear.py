@@ -729,6 +729,7 @@ class Linear(TransformerEngineBaseModule):
         moe_alltoall_overlap: Optional[bool] = None,
         moe_ring_exchange: Optional[bool] = None,
         moe_pipeline_split: Optional[bool] = None,
+        moe_num_pipeline_stage: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -763,9 +764,11 @@ class Linear(TransformerEngineBaseModule):
             self.ep_size = get_distributed_world_size(ep_group)
         else:
             self.ep_size = ep_size
+            self.set_expert_parallel_group(ep_group)
         self.moe_alltoall_overlap = moe_alltoall_overlap
         self.moe_ring_exchange = moe_ring_exchange
         self.moe_pipeline_split = moe_pipeline_split
+        self.moe_num_pipeline_stage = moe_num_pipeline_stage
             # (TODO:) ep_initialized?
         
 
@@ -1045,6 +1048,7 @@ class Linear(TransformerEngineBaseModule):
                     self.moe_alltoall_overlap,
                     self.moe_ring_exchange,
                     self.moe_pipeline_split,
+                    self.moe_num_pipeline_stage,
                 )
             out = linear_fn(*args)
 
