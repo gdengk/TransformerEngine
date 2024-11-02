@@ -1016,18 +1016,7 @@ def rs_a2a_bulk_overlap_gemm(
     for s in streams:
         s.wait_stream(torch.cuda.current_stream())
 
-    with torch.cuda.stream(streams[2]):
-        wgrad, grad_bias, _ = gemm(
-            weight,
-            input,
-            activation_dtype,
-            get_workspace(),
-            layout=layout,
-            grad=grad,
-            use_bias=False,
-            accumulate=accumulate_wgrad_into_param_main_grad,
-            out=out,
-        )
+    
 
     for i in range(chunk_size):
         with torch.cuda.stream(streams[0]):
@@ -1057,7 +1046,20 @@ def rs_a2a_bulk_overlap_gemm(
             else:
                 a2a_output[0] = a2a_in[0]
                 a2a_handles = rs_handles
-
+    
+    with torch.cuda.stream(streams[2]):
+        wgrad, grad_bias, _ = gemm(
+            weight,
+            input,
+            activation_dtype,
+            get_workspace(),
+            layout=layout,
+            grad=grad,
+            use_bias=False,
+            accumulate=accumulate_wgrad_into_param_main_grad,
+            out=out,
+        )
+    
     for a2a_handle in a2a_handles:
         a2a_handle.wait()
 
@@ -1515,7 +1517,7 @@ class _A2ALinear(torch.autograd.Function):
         # rs_a2a_overlap = (moe_ring_exchange or moe_pipeline_split) and (parallel_mode == "row") # row mode
         rs_a2a_overlap = moe_pipeline_split and (parallel_mode == "row") # row mode
         num_pipeline_stage = 4
-        ep_aggregate_size = 2
+        ep_aggregate_size = 1
 
         # rs_a2a_overlap = False
         # ub_overlap_rs = False
