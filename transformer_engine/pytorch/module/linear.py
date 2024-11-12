@@ -3,7 +3,7 @@
 # See LICENSE for license information.
 
 """Linear API"""
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union, List
 
 import torch
 
@@ -48,6 +48,7 @@ from ..graph import is_graph_capturing
 from ..float8_tensor import Float8Tensor
 from ..export import is_in_onnx_export_mode
 from ..tensor import QuantizedTensor
+from .a2a_linear import _A2ALinear
 
 __all__ = ["Linear"]
 
@@ -723,6 +724,13 @@ class Linear(TransformerEngineBaseModule):
         ub_overlap_rs: bool = False,
         ub_overlap_ag: bool = False,
         ub_name: Optional[str] = None,
+        ep_group: Optional[dist_group_type] = None,
+        ep_size: int = 1,
+        moe_use_a2alinear: Optional[bool] = None,
+        moe_ring_exchange: Optional[bool] = None,
+        moe_pipeline_split: Optional[bool] = None,
+        moe_num_pipeline_stage: Optional[int] = None,
+        ep_streams: Optional[List[torch.cuda.Stream]] = None,
     ) -> None:
         super().__init__()
 
@@ -751,6 +759,19 @@ class Linear(TransformerEngineBaseModule):
             self.tp_size = get_distributed_world_size(tp_group)
             self.set_tensor_parallel_group(tp_group)
         self.set_nccl_overlap_warning_if_tp()
+        
+        if ep_group is not None:
+            self.ep_group = ep_group
+            self.ep_size = get_distributed_world_size(ep_group)
+            self.ep_streams= ep_streams
+        else:
+            self.ep_size = ep_size
+            self.set_expert_parallel_group(ep_group)
+        self.moe_use_a2alinear = moe_use_a2alinear
+        self.moe_ring_exchange = moe_ring_exchange
+        self.moe_pipeline_split = moe_pipeline_split
+        self.moe_num_pipeline_stage = moe_num_pipeline_stage
+
 
         self.parallel_mode = parallel_mode
         assert (
@@ -879,7 +900,11 @@ class Linear(TransformerEngineBaseModule):
             self.gemm_bias_unfused_add = True
         else:
             self.gemm_bias_unfused_add = False
-
+    
+    def set_expert_parallel_group(self, ep_group: Union[dist_group_type, None], streams=None):
+        self.ep_streams=streams
+        self.ep_group=ep_group
+    
     def reset_parameters(self, defer_init=False):
         super().reset_parameters(defer_init=defer_init)
 
@@ -986,11 +1011,12 @@ class Linear(TransformerEngineBaseModule):
             from ..cpu_offload import CPUOffloadEnabled
 
             if torch.is_grad_enabled():
-                linear_fn = _Linear.apply
+                linear_fn = _Linear.apply if not self.moe_use_a2alinear else _A2ALinear.apply
                 args = []
             else:
-                linear_fn = _Linear.forward
+                linear_fn = _Linear.forward if not self.moe_use_a2alinear else _A2ALinear.forward
                 args = [None]
+            
             args += (
                 weight_tensor,
                 weight_fp8,
@@ -1016,6 +1042,16 @@ class Linear(TransformerEngineBaseModule):
                 fp8_output,
                 self.fsdp_group,
             )
+            if self.moe_use_a2alinear:
+                args +=(
+                    self.ep_group,
+                    self.ep_size,
+                    self.moe_use_a2alinear,
+                    self.moe_ring_exchange,
+                    self.moe_pipeline_split,
+                    self.moe_num_pipeline_stage,
+                    self.ep_streams,
+                )
             out = linear_fn(*args)
 
         if self.gemm_bias_unfused_add:

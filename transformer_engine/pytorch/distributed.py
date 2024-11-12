@@ -919,6 +919,31 @@ def _fsdp_gather_tensors(
                     target, gather_split_1d_tensor(target.data, fsdp_group).view(s)
                 )
 
+def alltoall(output_, input_, input_split_size, output_split_size, process_group=None, async_op=False):
+    world_size = get_distributed_world_size(process_group)
+    if world_size == 1:
+        return input_, None
+    if output_ is None:
+        if output_split_size is not None:
+            output_ = input_.new_empty(
+                    size=[sum(output_split_size)] + list(input_.size()[1:]),
+                    dtype=input_.dtype,
+                    device=torch.cuda.current_device(),
+                )
+        else:
+            output_ = torch.empty_like(input_)
+    
+    handle = torch.distributed.all_to_all_single(
+            output_,
+            input_,
+            output_split_sizes=output_split_size,
+            input_split_sizes=input_split_size,
+            group=process_group,
+            async_op=async_op
+        )
+    return output_, handle
+
+
 
 def _is_te_module(module):
     """
