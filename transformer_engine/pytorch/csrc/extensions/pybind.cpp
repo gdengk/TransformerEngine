@@ -195,6 +195,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("create_nvshmem_tensor", &nvshmem_api::create_nvshmem_tensor, "create nvshmem tensor", py::call_guard<py::gil_scoped_release>());
   m.def("nvshmem_send_on_stream", &nvshmem_api::nvshmem_send_on_stream, "send on stream using nvshmem backend", py::call_guard<py::gil_scoped_release>());
   m.def("nvshmem_wait_on_stream", &nvshmem_api::nvshmem_wait_on_stream, "wait on stream using nvshmem backend", py::call_guard<py::gil_scoped_release>());
+  m.def("nvshmem_send_on_stream_nbi", &nvshmem_api::nvshmem_send_on_stream_nbi, "wait on stream using nvshmem backend with nbi", py::call_guard<py::gil_scoped_release>());
+  m.def("nvshmem_finalize", &nvshmem_api::nvshmem_finalize, "nvshmem_finalize", py::call_guard<py::gil_scoped_release>());
+  m.def("nvshmem_quiet", &nvshmem_api::nvshmem_quiet, "nvshmem_quiet", py::call_guard<py::gil_scoped_release>());
+  m.def("nvshmem_alltoall_on_stream", &nvshmem_api::nvshmem_alltoall_on_stream, "nvshmem_alltoall_on_stream", py::call_guard<py::gil_scoped_release>());
+  m.def("nvshmem_allgather_on_stream_16bit", &nvshmem_api::nvshmem_allgather_on_stream_16bit, "nvshmem_allgather_on_stream_16bit", py::call_guard<py::gil_scoped_release>());
 
 
   // multi-tensor functions

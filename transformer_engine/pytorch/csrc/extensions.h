@@ -515,6 +515,11 @@ namespace nvshmem_api {
   torch::Tensor create_nvshmem_tensor(const std::vector<int64_t> &shape, c10::ScalarType dtype);
   void nvshmem_send_on_stream(torch::Tensor src, torch::Tensor dst, int peer, torch::Tensor signal);
   void nvshmem_wait_on_stream(torch::Tensor signal, int wait_kind);
+  void nvshmem_send_on_stream_nbi(torch::Tensor src, torch::Tensor dst, int peer, torch::Tensor signal);
+  void nvshmem_finalize();
+  void nvshmem_quiet();
+  void nvshmem_alltoall_on_stream(torch::Tensor src, torch::Tensor dst);
+  void nvshmem_allgather_on_stream_16bit(torch::Tensor src, torch::Tensor dst);
 }
 
 

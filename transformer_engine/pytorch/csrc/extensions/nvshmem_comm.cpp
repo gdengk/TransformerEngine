@@ -87,5 +87,81 @@ void nvshmem_send_on_stream(torch::Tensor src, torch::Tensor dst, int peer, torc
 
 }
 
+void nvshmem_send_on_stream_nbi(torch::Tensor src, torch::Tensor dst, int peer, torch::Tensor signal){
+  void* src_ptr = (void *) src.data_ptr();
+  void* dst_ptr = (void *) dst.data_ptr();
+  uint64_t* sig_addr = (uint64_t*) signal.data_ptr();
+  auto nelement = src.numel() * src.element_size();
+  uint64_t sigval = 1;
+  at::cuda::CUDAStream cur_stream = at::cuda::getCurrentCUDAStream();
+
+  // NVSHMEM_SIGNAL_ADD NVSHMEM_SIGNAL_SET
+  nvshmemx_putmem_signal_nbi_on_stream(dst_ptr, src_ptr, nelement, sig_addr, sigval, NVSHMEM_SIGNAL_SET, peer, (cudaStream_t)cur_stream);
+
+}
+void nvshmem_finalize(){
+  nvshmem_finalize();
+}
+void nvshmem_quiet(){
+  nvshmem_quiet();
+}
+void nvshmem_alltoall_on_stream(torch::Tensor src, torch::Tensor dst){
+
+  void* src_ptr = (void *) src.data_ptr();
+  void* dst_ptr = (void *) dst.data_ptr();
+  // use global team for now
+  nvshmem_team_t myteam = NVSHMEM_TEAM_WORLD;
+  auto totalnumpe = nvshmem_n_pes();
+  auto src_nelement = src.numel() * src.element_size() ;
+  size_t nelement = src_nelement/totalnumpe;
+  at::cuda::CUDAStream cur_stream = at::cuda::getCurrentCUDAStream();
+
+  nvshmemx_alltoallmem_on_stream(myteam, dst_ptr, src_ptr, nelement, (cudaStream_t)cur_stream);
+
+}
+// void nvshmem_allgather_on_stream_16bit(torch::Tensor src, torch::Tensor dst){
+//   float* src_ptr = (float*) src.data_ptr();
+//   float* dst_ptr = (float*) dst.data_ptr();
+//   // use global team for now
+//   nvshmem_team_t myteam = NVSHMEM_TEAM_WORLD;
+//   auto totalnumpe = nvshmem_n_pes();
+//   auto src_nelement = src.numel();
+
+//   at::cuda::CUDAStream cur_stream = at::cuda::getCurrentCUDAStream();
+//   // if( nvshmem_my_pe() == 0){
+//   //   printf("src ")
+//   // }
+//   auto returnval = nvshmemx_float_fcollect_on_stream(myteam, dst_ptr, src_ptr, src_nelement, (cudaStream_t)cur_stream);
+//   printf("allgather returned val %d\n", returnval);
+// }
+
+void nvshmem_allgather_on_stream_16bit(torch::Tensor src, torch::Tensor dst){
+  int16_t* src_ptr = reinterpret_cast<int16_t*> (src.data_ptr());
+  int16_t* dst_ptr = reinterpret_cast<int16_t*> (dst.data_ptr());
+  // use global team for now
+  nvshmem_team_t myteam = NVSHMEM_TEAM_WORLD;
+  auto totalnumpe = nvshmem_n_pes();
+  auto src_nelement = src.numel();
+
+  at::cuda::CUDAStream cur_stream = at::cuda::getCurrentCUDAStream();
+  auto returnval = nvshmemx_int16_fcollect_on_stream(myteam, dst_ptr, src_ptr, src_nelement, (cudaStream_t)cur_stream);
+  printf("allgather returned val %d\n", returnval);
+}
+// void nvshmem alltoall
+// nvshmemx_alltoallmem_on_stream(shmem_team_t team, void *dest, const void *source, size_t nelems, cudaStream_t stream)
+// int nvshmem_alltoallmem(shmem_team_t team, void *dest, const void *source, size_t nelems)
+
+// nvshmem allgather
+// int nvshmemx_TYPENAME_fcollect_on_stream(nvshmem_team_t team, TYPE *dest, const TYPE *source, size_t nelems, cudaStream_t stream)
+
+
+// nvshmem reduce scatter
+// seems not support bf16
+
+
+// nvshmem fence
+
+// nvshmem sync
+
 
 }
