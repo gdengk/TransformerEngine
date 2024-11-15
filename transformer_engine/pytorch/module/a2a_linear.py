@@ -54,7 +54,7 @@ from ..tensor import QuantizedTensor
 
 import math
 
-__all__ = ["_A2ALinear"]
+__all__ = ["_A2ALinear", "ring_exchange_overlap_ag_aggregate", "nvshmem_a2a_aggregate"]
 
 
 def get_send_recv_ops(
@@ -144,6 +144,37 @@ def p2p_with_step(step, send_tensor, recv_tensor, process_group, batch_p2p_comm)
     return send_recv_reqs
 
 
+def p2p_with_step_nvshmem(
+            step, 
+            send_tensor, 
+            recv_tensor,
+            signal_tensor, 
+            process_group, 
+            streams,
+            done_event,
+):
+    assert step > 0, "the step has to be a positive num."
+
+    pg_world_size = torch.distributed.get_world_size(process_group)
+    local_rank = torch.distributed.get_rank(process_group)
+
+    send_dst_PE_rank = torch.distributed.get_global_rank(
+        process_group, (local_rank + step) % pg_world_size
+    )
+
+    streamid=0
+    num_streams = len(streams)
+    with torch.cuda.stream(streams[streamid]):
+        if done_event is not None:
+            streams[streamid].wait_event(done_event)
+        tex.nvshmem_send_on_stream(send_tensor, recv_tensor, send_dst_PE_rank, signal_tensor)
+
+        streamid = (streamid + 1)%num_streams
+        
+
+
+
+
 def multi_steps_p2p(
     step_list,
     send_tensor_list,
@@ -200,6 +231,29 @@ def multi_steps_p2p(
         send_recv_reqs = all_send_recv_ops
     return send_recv_reqs
 
+def multi_steps_p2p_nvshmem(
+    send_dst_rank_list,
+    send_tensor_list,
+    recv_tensor_list,
+    send_dst_signal_list,
+    process_group,
+    streams,
+):
+    # what is needed here?
+    # send side: src_tensor_idx(dst_chip_id), dst_chip_id, dst_tensor_idx(from src_chip_id, works for signal as well)
+    # recv side: other_chip_id related dst_tensor_idx (for signalling as well, make sure everything in order)
+    # stream synchronization is managed outside of this function
+    assert streams is not None, "must have streams arg set for nvshmem P2P"
+    num_streams = len(streams)
+    streamid = 0
+
+    for send_dst_rank, send_tensor, recv_tensor, send_dst_signal in zip(send_dst_rank_list, send_tensor_list, recv_tensor_list, send_dst_signal_list):
+        send_dst_PE_rank = torch.distributed.get_global_rank(process_group, send_dst_rank)
+        with torch.cuda.stream(streams[streamid]):
+            tex.nvshmem_send_on_stream(send_tensor, recv_tensor, send_dst_PE_rank, send_dst_signal)      
+        streamid = (streamid + 1)%num_streams
+    
+    
 
 def aggregate_p2p(
     step,
@@ -267,6 +321,56 @@ def aggregate_p2p(
         send_recv_reqs = send_recv_ops
     return send_recv_reqs
 
+def aggregate_p2p_nvshmem(
+    step,
+    src_buf,
+    dst_buf,
+    signal_list,
+    aggregate_size,
+    dst_buf_nonag_offset,
+    process_group,
+    streams,
+    done_event = None,
+):
+    # stream synchronization is managed out side of this function
+    pg_world_size = torch.distributed.get_world_size(process_group)
+    local_rank = torch.distributed.get_rank(process_group)
+
+    sub_pg_idx = local_rank // aggregate_size
+    sub_pg_rank = local_rank % aggregate_size
+    num_pgs = pg_world_size // aggregate_size
+
+    dst_sub_pg_idx = (sub_pg_idx + step)%num_pgs
+    dst_sub_pg_offset = dst_sub_pg_idx*aggregate_size
+    src_sub_pg_idx = (sub_pg_idx - step + num_pgs)%num_pgs
+    src_sub_pg_offset = src_sub_pg_idx * aggregate_size
+
+    streamid=0
+    num_streams = len(streams)
+    recv_singal_idx_list = []
+
+    for i in range(aggregate_size):
+        dst_rank = dst_sub_pg_offset + (i+sub_pg_rank)%aggregate_size
+        src_rank = src_sub_pg_offset + (sub_pg_rank-i+aggregate_size)%aggregate_size
+
+        send_tensor = src_buf[dst_rank]
+        send_dst_PE_rank = torch.distributed.get_global_rank(process_group, dst_rank)
+        recv_tensor = dst_buf[local_rank+dst_buf_nonag_offset]
+        send_dst_signal = signal_list[local_rank+dst_buf_nonag_offset]
+        recv_singal_idx = src_rank + dst_buf_nonag_offset
+
+        with torch.cuda.stream(streams[streamid]):
+            if done_event is not None:
+                streams[streamid].wait_event(done_event)
+            tex.nvshmem_send_on_stream(send_tensor, recv_tensor, send_dst_PE_rank, send_dst_signal)
+        
+        recv_singal_idx_list.append(recv_singal_idx)
+        streamid = (streamid+1)%num_streams
+    
+    return recv_singal_idx_list
+
+    
+    
 
 def ring_exchange_overlap_ag(
     weight,
@@ -1235,6 +1339,213 @@ def pipeline_split_bulk_rs_a2a(
         torch.cuda.current_stream().wait_stream(s)
 
     return wgrad, grad_bias, a2a_output
+
+##### NVSHMEM based communication ######
+def nvshmem_a2a_aggregate(
+    weight,
+    input,
+    activation_dtype,
+    out,
+    ub_algo,
+    ub_obj,
+    extra_output_tensor,
+    ep_aggregate,
+    tp_aggregate,
+    ep_group,
+    ep_size,
+    tp_group,
+    tp_size,
+    layout="TN",
+    grad=False,
+    external_streams=None,
+    intermediate_nvshmem_tensor = None,
+    nvshmem_signal_lists = None,
+    nvshmem_ep_streams = None,
+    nvshmem_tp_streams = None,
+    wait_kind=0,
+):
+    torch.cuda.nvtx.range_push("nvshmem_a2a_aggregate")
+    # input must be an NVSHMEM tensor 
+    # this needs to be refactored later in the whole code
+    # output is the output of gemm, which does not need to be a nvshmem tensor
+    assert intermediate_nvshmem_tensor is not None, "Need to provide intermediate nvshmem tensor as input"
+    assert len(nvshmem_signal_lists) == tp_size*ep_size is not None, "must have enough space for the signaling"
+    ep_local_rank = torch.distributed.get_rank(ep_group) if ep_size != 1 else 0
+    tp_local_rank = torch.distributed.get_rank(tp_group) if tp_size != 1 else 0
+
+    if ep_aggregate is None or ep_size == 1:
+        ep_aggregate = 1
+    if tp_aggregate is None or tp_size == 1:
+        tp_aggregate = 1
+
+    assert ep_size % ep_aggregate == 0, "ep_size should be divisible by ep_aggregate."
+    assert tp_size % tp_aggregate == 0, "ep_size should be divisible by ep_aggregate."
+
+    ep_chunksize = ep_size // ep_aggregate
+    tp_chunksize = tp_size // tp_aggregate
+
+    if external_streams is not None:
+        streams = external_streams
+    else:
+        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    
+    chunked_input = torch.chunk(input, chunks=ep_size, dim=0)
+    comm_buf_ag_view = torch.chunk(intermediate_nvshmem_tensor, chunks=ep_chunksize * tp_chunksize, dim=0)
+    comm_buf_nonag_view = torch.chunk(intermediate_nvshmem_tensor, chunks=ep_size * tp_size, dim=0)
+    chunked_out = torch.chunk(out, chunks=ep_chunksize * tp_chunksize, dim=0)
+
+    cublasworkspace = get_multi_stream_cublas_workspace()
+    ep_done = torch.cuda.Event()
+    tp_done = torch.cuda.Event()
+    # wait_kind = 2
+
+
+    for s in streams + nvshmem_ep_streams + nvshmem_tp_streams:
+        s.wait_stream(torch.cuda.current_stream())
+    
+    sub_pg_idx = ep_local_rank // ep_aggregate
+    sub_pg_rank = ep_local_rank % ep_aggregate
+    sub_pg_offset = sub_pg_idx * ep_aggregate
+
+    # the comm_buf are arranged in EP - TP order
+    comm_buf_nonag_offset = tp_local_rank * ep_size
+
+    ep_wait_signal_idx_list = []
+    tp_wait_signal_idx_list = []
+
+    if ep_aggregate > 1:
+        preprocess_step_list = list(range(1, ep_aggregate))
+        preprocess_send_dst_rank_list = []
+        preprocess_send_tensor_list = []
+        preprocess_recv_tensor_list = []
+        preprocess_signal_list = []
+
+        for i in preprocess_step_list:
+            # send dst chip rank
+            
+            sub_send_src_rank = sub_pg_offset + (sub_pg_rank + i) % ep_aggregate
+            sub_recv_dst_rank = (
+                sub_pg_offset + (sub_pg_rank - i + ep_aggregate) % ep_aggregate
+            )
+            preprocess_send_tensor_list.append(chunked_input[sub_send_src_rank])
+            preprocess_recv_tensor_list.append(
+                comm_buf_nonag_view[ep_local_rank + comm_buf_nonag_offset]
+            )
+            preprocess_signal_list.append(nvshmem_signal_lists[ep_local_rank + comm_buf_nonag_offset])
+            preprocess_send_dst_rank_list.append(sub_send_src_rank)
+            ep_wait_signal_idx_list.append(sub_recv_dst_rank+comm_buf_nonag_offset)
+            
+        multi_steps_p2p_nvshmem(
+            preprocess_send_dst_rank_list,
+            preprocess_send_tensor_list,
+            preprocess_recv_tensor_list,
+            preprocess_signal_list,
+            ep_group,
+            nvshmem_ep_streams,
+        )
+    # Local data D2D on main stream
+    comm_buf_nonag_view[ep_local_rank + comm_buf_nonag_offset].copy_(
+        chunked_input[ep_local_rank]
+    )
+    # actually this should be all the other streams wait for current cuda event
+    # torch.cuda.current_stream().wait(preprocess_event)
+
+    for i in range(ep_chunksize):
+        cur_ep_i = (sub_pg_idx - i + ep_chunksize) % ep_chunksize
+        for j in range(tp_chunksize):
+            streamid = (i * tp_chunksize + j) % 2
+
+            if j == 0:
+                with torch.cuda.stream(streams[streamid]):
+                    if len(ep_wait_signal_idx_list) !=0:
+                        for signal_id in ep_wait_signal_idx_list:
+                            tex.nvshmem_wait_on_stream(nvshmem_signal_lists[signal_id], wait_kind)
+                    ep_done.record()
+
+                # work on ep streams
+                if i < ep_chunksize - 1:
+                    # has an input to accept ep_done and synchronize on all streams
+                    ep_wait_signal_idx_list = aggregate_p2p_nvshmem(
+                        i+1,
+                        chunked_input,
+                        comm_buf_nonag_view,
+                        nvshmem_signal_lists,
+                        ep_aggregate,
+                        comm_buf_nonag_offset,
+                        ep_group,
+                        nvshmem_ep_streams,
+                        ep_done,
+                    )
+            
+            cur_tp_i = (tp_local_rank - j + tp_size) % tp_size
+            dst_tp_i = (tp_local_rank - j - 1 + tp_size) % tp_size
+            src_comm_buf_i = cur_tp_i * ep_chunksize + cur_ep_i
+            # start TP inner ring-exchange
+            with torch.cuda.stream(streams[streamid]):
+                if len(tp_wait_signal_idx_list) !=0:
+                    for signal_id in tp_wait_signal_idx_list:
+                        tex.nvshmem_wait_on_stream(nvshmem_signal_lists[signal_id], wait_kind)
+                tp_done.record()
+
+                _ = gemm(
+                    weight,
+                    comm_buf_ag_view[src_comm_buf_i],
+                    activation_dtype,
+                    cublasworkspace[streamid],
+                    out=chunked_out[src_comm_buf_i],
+                    ub_algo=ub_algo,
+                    ub=ub_obj,
+                    extra_output_tensor=extra_output_tensor,
+                    layout=layout,
+                    grad=grad,
+                )
+            
+            # issue TP communication on TP streams
+            if j < tp_chunksize - 1:
+                # need to wait for previous TP to be done
+                # use the very first signal as the TP signaling space, actually we have redudant space in this code
+                src_comm_buf_i_nonag_view = cur_tp_i * ep_size + cur_ep_i
+                dst_comm_buf_i_noag_view = dst_tp_i * ep_size + cur_ep_i
+                tp_wait_signal_idx_list = p2p_with_step_nvshmem(
+                    1,
+                    comm_buf_ag_view[src_comm_buf_i],
+                    comm_buf_ag_view[src_comm_buf_i],
+                    nvshmem_signal_lists[src_comm_buf_i_nonag_view],
+                    tp_group,
+                    nvshmem_tp_streams,
+                    tp_done,
+                )
+                tp_wait_signal_idx_list = [dst_comm_buf_i_noag_view]
+            else:
+                tp_wait_signal_idx_list = []
+    
+    for s in streams + nvshmem_ep_streams + nvshmem_tp_streams:
+        torch.cuda.current_stream().wait_stream(s)
+
+    # does not care about a2a_out for now 
+    # for a2a_out, since this is checkpoint, need to be D2D to normal memory 
+    # for comm_full_buf, this potentially could be reused later as the input of gemms since all of them is getting processed in one module
+    torch.cuda.nvtx.range_pop()
+    return out 
+            
+
+
+
+                    
+
+
+
+
+
+    
+
+
+
+
+
+
+
+
 
 
 class _A2ALinear(torch.autograd.Function):
