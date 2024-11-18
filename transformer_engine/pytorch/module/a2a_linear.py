@@ -54,7 +54,7 @@ from ..tensor import QuantizedTensor
 
 import math
 
-__all__ = ["_A2ALinear", "ring_exchange_overlap_ag_aggregate", "nvshmem_a2a_aggregate"]
+__all__ = ["_A2ALinear", "ring_exchange_overlap_ag_aggregate", "nvshmem_ring_exchange_ag_aggregate"]
 
 
 def get_send_recv_ops(
@@ -1341,7 +1341,7 @@ def pipeline_split_bulk_rs_a2a(
     return wgrad, grad_bias, a2a_output
 
 ##### NVSHMEM based communication ######
-def nvshmem_a2a_aggregate(
+def nvshmem_ring_exchange_ag_aggregate(
     weight,
     input,
     activation_dtype,
@@ -1393,6 +1393,7 @@ def nvshmem_a2a_aggregate(
     comm_buf_ag_view = torch.chunk(intermediate_nvshmem_tensor, chunks=ep_chunksize * tp_chunksize, dim=0)
     comm_buf_nonag_view = torch.chunk(intermediate_nvshmem_tensor, chunks=ep_size * tp_size, dim=0)
     chunked_out = torch.chunk(out, chunks=ep_chunksize * tp_chunksize, dim=0)
+    a2a_out = torch.empty_like(input)
 
     cublasworkspace = get_multi_stream_cublas_workspace()
     ep_done = torch.cuda.Event()
@@ -1519,14 +1520,22 @@ def nvshmem_a2a_aggregate(
             else:
                 tp_wait_signal_idx_list = []
     
+    # D2D copy for a2a_out, used in backward
+    torch.cuda.current_stream().wait_event(ep_done)
+    dim_size = comm_buf_nonag_view[0].size(0)
+    a2a_out.copy_(intermediate_nvshmem_tensor[comm_buf_nonag_offset * dim_size : (comm_buf_nonag_offset + ep_size) * dim_size])
+
+
+    
     for s in streams + nvshmem_ep_streams + nvshmem_tp_streams:
         torch.cuda.current_stream().wait_stream(s)
+    
+    # dim_size = comm_buf_nonag_view[0].size(0)
+    # a2a_out.copy_(intermediate_nvshmem_tensor[comm_buf_nonag_offset * dim_size : (comm_buf_nonag_offset + ep_size) * dim_size])
 
-    # does not care about a2a_out for now 
-    # for a2a_out, since this is checkpoint, need to be D2D to normal memory 
     # for comm_full_buf, this potentially could be reused later as the input of gemms since all of them is getting processed in one module
     torch.cuda.nvtx.range_pop()
-    return out 
+    return out, a2a_out 
             
 
 
