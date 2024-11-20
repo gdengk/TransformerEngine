@@ -1618,6 +1618,12 @@ def nvshmem_pipeline_split_ag(
 
     # calculate the local D2D offset
     ep_dim_size = comm_buf_a2a_view[0].size(0)//ep_size
+    a2a_D2D_tuples = [] # src, dst
+    for i in range(num_pipeline_stage):
+        _input_d2d_list = torch.chunk(chunked_input[i], chunks = ep_size, dim=0)
+        _comm_buf_a2d_d2d_list = torch.chunk(comm_buf_a2a_view[i*tp_size + tp_local_rank], chunks = ep_size, dim=0)
+        a2a_D2D_tuples.append((_input_d2d_list[ep_local_rank], _comm_buf_a2d_d2d_list[ep_local_rank]))
+
 
 
 
@@ -1658,7 +1664,9 @@ def nvshmem_pipeline_split_ag(
                 # D2D copy for on-chip data
                 # However when ep_size = 1, don't necessarily need 2 nvshmemspace, we can optimize it to be one space
                 # (TODO:) assert this function to work under ep_size > 1
-                comm_buf_a2a_view[tp_size *(i-1) + tp_local_rank][ep_dim_size*ep_local_rank::ep_dim_size].copy_(chunked_input[i-1][ep_dim_size*ep_local_rank::ep_dim_size])
+                # this is not translating to D2D
+                # comm_buf_a2a_view[tp_size *(i-1) + tp_local_rank][ep_dim_size*ep_local_rank::ep_dim_size].copy_(chunked_input[i-1][ep_dim_size*ep_local_rank::ep_dim_size])
+                a2a_D2D_tuples[i-1][1].copy_(a2a_D2D_tuples[i-1][0])
                 if ep_size != 1:
                     tex.nvshmem_a2a_wait_on_stream(chunked_ep_signals[i-1], ep_group)
                 ep_done.record()
