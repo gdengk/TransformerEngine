@@ -54,7 +54,7 @@ from ..tensor import QuantizedTensor
 
 import math
 
-__all__ = ["_A2ALinear", "ring_exchange_overlap_ag_aggregate", "nvshmem_ring_exchange_ag_aggregate"]
+__all__ = ["_A2ALinear", "ring_exchange_overlap_ag_aggregate", "nvshmem_ring_exchange_ag_aggregate", "nvshmem_pipeline_split_ag", "pipeline_split_ag"]
 
 
 def get_send_recv_ops(
@@ -1562,6 +1562,140 @@ def nvshmem_ring_exchange_rs_aggregate(
     wait_kind=0,      
 ):
     pass
+
+
+
+def nvshmem_pipeline_split_ag(
+    weight,
+    input,
+    activation_dtype,
+    out,
+    ub_algo,
+    ub_obj,
+    extra_output_tensor,
+    num_pipeline_stage,
+    ep_group,
+    ep_size,
+    tp_group,
+    tp_size,
+    layout="TN",
+    grad=False,
+    external_streams=None,
+    intermediate_nvshmem_tensor=None,
+    nvshmem_tp_signals = None,
+    nvshmem_ep_signals = None,
+    nvshmem_ep_streams = None,
+    nvshmem_tp_streams = None,
+):
+    torch.cuda.nvtx.range_push("nvshmem_pipeline_split_ag")
+    # input is in nvshmem memory
+    chunked_input = torch.chunk(input, chunks=num_pipeline_stage, dim=0)
+    # intermediate nvshmem_tensor is arranged as [num_pipeline_stage, TP_size, EP_size, ...]
+    comm_buf_a2a_view = torch.chunk(intermediate_nvshmem_tensor, chunks=num_pipeline_stage*tp_size, dim=0)
+    comm_buf_ag_view = torch.chunk(intermediate_nvshmem_tensor, chunks=num_pipeline_stage, dim=0)
+    chunked_output = torch.chunk(out, chunks=num_pipeline_stage, dim=0)
+
+    # ep_signal num_pipeline_stage * ep_size
+    chunked_ep_signals = torch.chunk(nvshmem_ep_signals, chunks=num_pipeline_stage, dim=0)
+    chunked_tp_signals = torch.chunk(nvshmem_tp_signals, chunks=num_pipeline_stage, dim=0)
+
+    a2a_out = torch.empty_like(input)
+    chunked_a2a_out = torch.chunk(a2a_out, chunks=num_pipeline_stage, dim=0)
+
+    cublasworkspace = get_multi_stream_cublas_workspace()
+
+    num_ep_streams = len(nvshmem_ep_streams)
+    num_tp_streams = len(nvshmem_tp_streams)
+    assert num_tp_streams>1, "num of tp streams should be larger than 2 to hide D2D overhead"
+    tp_local_rank = torch.distributed.get_rank(tp_group) if tp_size != 1 else 0
+    ep_local_rank = torch.distributed.get_rank(ep_group) if ep_size != 1 else 0
+    
+    
+    tp_global_ranks = torch.distributed.get_process_group_ranks(tp_group)
+    ep_global_ranks = torch.distributed.get_process_group_ranks(ep_group)
+    ep_done = torch.cuda.Event()
+    tp_done = torch.cuda.Event()
+
+    # calculate the local D2D offset
+    ep_dim_size = comm_buf_a2a_view[0].size(0)//ep_size
+
+
+
+
+    if external_streams is not None:
+        streams = external_streams
+    else:
+        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    
+    for s in streams+nvshmem_ep_streams+nvshmem_tp_streams:
+        s.wait_stream(torch.cuda.current_stream())
+    
+    extra_stage = 2 if tp_size != 1 else 1
+
+    for i in range(num_pipeline_stage + extra_stage):
+
+        
+        # wait for ag handle
+        if i > extra_stage - 1:
+            with torch.cuda.stream(streams[i % 2]):
+                if tp_done is not None:
+                    streams[i % 2].wait_event(tp_done)
+                _ = gemm(
+                    weight,
+                    comm_buf_ag_view[i - extra_stage],
+                    activation_dtype,
+                    cublasworkspace[i % 2],
+                    out=chunked_output[i - extra_stage],
+                    ub_algo=ub_algo,
+                    ub=ub_obj,
+                    extra_output_tensor=extra_output_tensor,
+                    layout=layout,
+                    grad=grad,
+                )
+
+        if i >0 and i < num_pipeline_stage+1:
+            with torch.cuda.stream(nvshmem_tp_streams[i % num_tp_streams]):
+                # D2D copy for on-chip data
+                # However when ep_size = 1, don't necessarily need 2 nvshmemspace, we can optimize it to be one space
+                # (TODO:) assert this function to work under ep_size > 1
+                comm_buf_a2a_view[tp_size *(i-1) + tp_local_rank][ep_dim_size*ep_local_rank::ep_dim_size].copy_(chunked_input[i-1][ep_dim_size*ep_local_rank::ep_dim_size])
+                if ep_size != 1:
+                    tex.nvshmem_a2a_wait_on_stream(chunked_ep_signals[i-1], ep_group)
+                ep_done.record()
+                if tp_size !=1:
+                    # actually this CPP function could handle tp_size = 1, the condition could be removed.
+                    tex.nvshmem_ag_from_p2p_on_stream(comm_buf_ag_view[i-1], chunked_tp_signals[i-1], tp_local_rank, tp_global_ranks)
+                tp_done.record()
+        
+        
+        if i < num_pipeline_stage:
+            if ep_size != 1:
+                # launch A2A communication
+                with torch.cuda.stream(nvshmem_ep_streams[i % num_ep_streams]):
+                    tex.nvshmem_a2a_from_p2p_on_stream(chunked_input[i], comm_buf_a2a_view[tp_size *i + tp_local_rank], chunked_ep_signals[i], ep_local_rank, ep_global_ranks)
+        
+        if i >0 and i < num_pipeline_stage+1:
+            # local copy of a2a out for backward on default main stream
+            if ep_size != 1:
+                torch.cuda.current_stream().wait_event(ep_done)
+            chunked_a2a_out[i-1].copy_(comm_buf_a2a_view[tp_size *(i-1) + tp_local_rank])
+        
+    for s in streams+nvshmem_ep_streams+nvshmem_tp_streams:
+        torch.cuda.current_stream().wait_stream(s)
+    
+    torch.cuda.nvtx.range_pop()
+
+    return out, a2a_out
+
+
+
+
+
+
+
+
+
+    
     
             
 
