@@ -519,6 +519,9 @@ namespace nvshmem_api {
   void nvshmem_finalize();
   void nvshmem_quiet();
   void nvshmem_alltoall_on_stream(torch::Tensor src, torch::Tensor dst);
+  void nvshmem_a2a_from_p2p_on_stream(torch::Tensor src, torch::Tensor dst, torch::Tensor singals, int my_rank, const std::vector<int> &global_ranks);
+  void nvshmem_a2a_wait_on_stream(torch::Tensor signals, c10d::ProcessGroup *pg);
+  void nvshmem_ag_from_p2p_on_stream(torch::Tensor buf, torch::Tensor singals, int my_rank, const std::vector<int> &global_ranks);
   void nvshmem_allgather_on_stream_16bit(torch::Tensor src, torch::Tensor dst);
 }
 

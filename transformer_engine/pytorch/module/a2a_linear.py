@@ -1536,6 +1536,33 @@ def nvshmem_ring_exchange_ag_aggregate(
     # for comm_full_buf, this potentially could be reused later as the input of gemms since all of them is getting processed in one module
     torch.cuda.nvtx.range_pop()
     return out, a2a_out 
+
+
+def nvshmem_ring_exchange_rs_aggregate(
+    weight,
+    input,
+    activation_dtype,
+    out,
+    ub_algo,
+    ub_obj,
+    extra_output_tensor,
+    ep_aggregate,
+    tp_aggregate,
+    ep_group,
+    ep_size,
+    tp_group,
+    tp_size,
+    layout="TN",
+    grad=False,
+    external_streams=None,
+    intermediate_nvshmem_tensor = None,
+    nvshmem_signal_lists = None,
+    nvshmem_ep_streams = None,
+    nvshmem_tp_streams = None,
+    wait_kind=0,      
+):
+    pass
+    
             
 
 

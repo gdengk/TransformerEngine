@@ -119,6 +119,88 @@ void nvshmem_alltoall_on_stream(torch::Tensor src, torch::Tensor dst){
   nvshmemx_alltoallmem_on_stream(myteam, dst_ptr, src_ptr, nelement, (cudaStream_t)cur_stream);
 
 }
+
+void nvshmem_a2a_from_p2p_on_stream(torch::Tensor src, torch::Tensor dst, torch::Tensor singals, int my_rank, const std::vector<int> &global_ranks){
+
+  int num_ranks = global_ranks.size();
+
+  if (num_ranks == 1) return ;
+
+  char* src_start_ptr = (char *) src.data_ptr();
+  char* dst_start_ptr = (char *) dst.data_ptr();
+
+  uint64_t* signal_start_addr = (uint64_t*) singals.data_ptr();
+  size_t perchunksize = src.numel() * src.element_size()/num_ranks;
+  uint64_t sigval = 1;
+  at::cuda::CUDAStream cur_stream = at::cuda::getCurrentCUDAStream();
+  int dst_rank, dst_PE;
+  char* src_ptr, *dst_ptr;
+  uint64_t* sig_addr;
+
+  for (int idx =0 ; idx < num_ranks-1; idx ++ ){
+    dst_rank = (my_rank + idx + 1) % num_ranks;
+    dst_PE = global_ranks.at(dst_rank);
+
+    src_ptr = src_start_ptr + dst_rank*perchunksize;
+    dst_ptr = dst_start_ptr + my_rank*perchunksize;
+    sig_addr = signal_start_addr + my_rank;
+    nvshmemx_putmem_signal_on_stream((void *)dst_ptr, (void *)src_ptr, perchunksize, sig_addr, sigval, NVSHMEM_SIGNAL_SET, dst_PE, (cudaStream_t)cur_stream);
+  }
+}
+
+void nvshmem_ag_from_p2p_on_stream(torch::Tensor buf, torch::Tensor singals, int my_rank, const std::vector<int> &global_ranks){
+  // buf size has to be the output of AG
+  int num_ranks = global_ranks.size();
+  if (num_ranks == 1) return ;
+
+  char* buf_start_ptr = (char *) buf.data_ptr();
+  uint64_t* signal_start_addr = (uint64_t*) singals.data_ptr();
+  size_t perchunksize = buf.numel() * buf.element_size()/num_ranks;
+  at::cuda::CUDAStream cur_stream = at::cuda::getCurrentCUDAStream();
+  int cur_rank, recv_rank, dst_PE;
+  char* src_ptr;
+  uint64_t* send_sig_addr, *recv_sig_addr;
+  uint64_t signal_reset = 0;
+  uint64_t sigval = 1;
+
+
+  dst_PE =  global_ranks.at((my_rank + 1) % num_ranks);
+
+  for (int idx =0 ; idx < num_ranks-1; idx ++ ){
+    cur_rank = (my_rank - idx + num_ranks) % num_ranks;
+    recv_rank = (my_rank - idx - 1 + num_ranks)% num_ranks;
+    src_ptr = buf_start_ptr + cur_rank*perchunksize;
+    send_sig_addr = signal_start_addr + cur_rank;
+    nvshmemx_putmem_signal_on_stream((void *)src_ptr, (void *)src_ptr, perchunksize, send_sig_addr, sigval, NVSHMEM_SIGNAL_SET, dst_PE, (cudaStream_t)cur_stream);
+    recv_sig_addr = signal_start_addr + recv_rank;
+    cuStreamWaitValue64((CUstream)cur_stream, (CUdeviceptr)recv_sig_addr, (cuuint64_t)sigval, CU_STREAM_WAIT_VALUE_GEQ);
+    cuStreamWriteValue64((CUstream)cur_stream, (CUdeviceptr)recv_sig_addr, (cuuint64_t)signal_reset, CU_STREAM_WRITE_VALUE_DEFAULT);
+  }
+}
+
+
+void nvshmem_a2a_wait_on_stream(torch::Tensor signals, c10d::ProcessGroup *pg){
+  uint64_t* sig_start_addr = (uint64_t*) signals.data_ptr();
+  cudaStream_t cur_stream = (cudaStream_t)at::cuda::getCurrentCUDAStream();
+
+  int my_rank = pg->getRank();
+  int num_ranks = pg->getSize();
+  // auto mask = std::make_unique<int[]>(num_ranks);
+  // std::fill_n(mask.get(), num_ranks, 0);
+  // mask[my_rank] = 1;
+  uint64_t*  sig_addr;
+  uint64_t wait_value = 1;
+  uint64_t signal_reset = 0;
+
+  for (int i =0; i <num_ranks; i++){
+    if (i != my_rank){
+    sig_addr = sig_start_addr + i;
+    cuStreamWaitValue64((CUstream)cur_stream, (CUdeviceptr)sig_addr, (cuuint64_t)wait_value, CU_STREAM_WAIT_VALUE_GEQ);
+    cuStreamWriteValue64((CUstream)cur_stream, (CUdeviceptr)sig_addr, (cuuint64_t)signal_reset, CU_STREAM_WRITE_VALUE_DEFAULT);
+    }
+  }
+}
+
 // void nvshmem_allgather_on_stream_16bit(torch::Tensor src, torch::Tensor dst){
 //   float* src_ptr = (float*) src.data_ptr();
 //   float* dst_ptr = (float*) dst.data_ptr();

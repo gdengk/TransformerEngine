@@ -199,6 +199,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("nvshmem_finalize", &nvshmem_api::nvshmem_finalize, "nvshmem_finalize", py::call_guard<py::gil_scoped_release>());
   m.def("nvshmem_quiet", &nvshmem_api::nvshmem_quiet, "nvshmem_quiet", py::call_guard<py::gil_scoped_release>());
   m.def("nvshmem_alltoall_on_stream", &nvshmem_api::nvshmem_alltoall_on_stream, "nvshmem_alltoall_on_stream", py::call_guard<py::gil_scoped_release>());
+  m.def("nvshmem_a2a_from_p2p_on_stream", &nvshmem_api::nvshmem_a2a_from_p2p_on_stream, "nvshmem_a2a_from_p2p_on_stream", py::call_guard<py::gil_scoped_release>());
+  m.def("nvshmem_ag_from_p2p_on_stream", &nvshmem_api::nvshmem_ag_from_p2p_on_stream, "nvshmem_ag_from_p2p_on_stream", py::call_guard<py::gil_scoped_release>());
+  m.def("nvshmem_a2a_wait_on_stream", &nvshmem_api::nvshmem_a2a_wait_on_stream, "nvshmem_a2a_wait_on_stream", py::call_guard<py::gil_scoped_release>());
   m.def("nvshmem_allgather_on_stream_16bit", &nvshmem_api::nvshmem_allgather_on_stream_16bit, "nvshmem_allgather_on_stream_16bit", py::call_guard<py::gil_scoped_release>());
 
 

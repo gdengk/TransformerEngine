@@ -21,6 +21,13 @@ __global__ void __launch_bounds__(1) wait_until_on_stream_and_reset(uint64_t* wa
     nvshmem_uint64_wait_until(wait_flag, NVSHMEM_CMP_EQ, wait_value);
     *wait_flag = signal_reset;
 }
+
+// __global__ void __launch_bounds__(1) group_wait_until_on_stream_and_reset(uint64_t* wait_flag, int length, int* status, uint64_t wait_value, uint64_t signal_reset) {
+//     nvshmem_uint64_wait_until_all(wait_flag, length, status, NVSHMEM_CMP_EQ, wait_value);
+//     *wait_flag = signal_reset;
+// }
+
+
 void nvshmem_wait_on_stream(uint64_t* sig_addr, int wait_kind, cudaStream_t stream){
   // use implict streams
   uint64_t wait_value = 1;
