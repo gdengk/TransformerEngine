@@ -47,7 +47,7 @@ __device__ inline T warp_reduce_on_shmem(T *data_ptr, int data_size, ReduceFuncT
   // Some value is hanlded in local thread
   // Thread 0 is responsible for the: 0-th, 32-th, 64-th, 96-th ...
   // Reduce the value in local thread
-  volatile float val = lane_id < data_size ? data_ptr[lane_id] : default_val;
+  float val = lane_id < data_size ? data_ptr[lane_id] : default_val;
   for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
     val = reduce_func(val, data_ptr[i]);
   }
@@ -78,7 +78,7 @@ __device__ inline T masked_warp_reduce_on_shmem(T *data_ptr, bool *mask, int dat
   // Some value is hanlded in local thread
   // Thread 0 is responsible for the: 0-th, 32-th, 64-th, 96-th ...
   // Reduce the value in local thread
-  volatile float val = lane_id < data_size && mask[lane_id] ? data_ptr[lane_id] : default_val;
+  float val = lane_id < data_size && mask[lane_id] ? data_ptr[lane_id] : default_val;
   for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
     if (mask[i]) {
       val = reduce_func(val, data_ptr[i]);
@@ -211,15 +211,15 @@ __device__ inline void naive_topk_and_mask(float *scores, int data_size, int top
   // After looping topk times, the topk_indices will be the topk indices
   for (int k = 0; k < topk; k++) {
     // Find the max value and its index
-    volatile float val = (lane_id < data_size && !is_masked(k, lane_id))
+    float val = (lane_id < data_size && !is_masked(k, lane_id))
                              ? scores[lane_id]
                              : -std::numeric_limits<float>::infinity();
-    volatile int index = (lane_id < data_size) ? lane_id : 0;
+    int index = (lane_id < data_size) ? lane_id : 0;
     // Some value is hanlded in local thread
     // Thread 0 is responsible for the: 0-th, 32-th, 64-th, 96-th ...
     // Reduce the value in local thread
     for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
-      volatile float cur_val =
+      float cur_val =
           (is_masked(k, i)) ? -std::numeric_limits<float>::infinity() : scores[i];
       if (cur_val > val) {
         val = cur_val;
@@ -228,8 +228,8 @@ __device__ inline void naive_topk_and_mask(float *scores, int data_size, int top
     }
     // Warp shuffle between threads
     for (int s = 16; s > 0; s /= 2) {
-      volatile auto shuffled_val = __shfl_xor_sync(0xffffffff, val, s);
-      volatile auto shuffled_index = __shfl_xor_sync(0xffffffff, index, s);
+      auto shuffled_val = __shfl_xor_sync(0xffffffff, val, s);
+      auto shuffled_index = __shfl_xor_sync(0xffffffff, index, s);
       if (shuffled_val > val) {
         val = shuffled_val;
         index = shuffled_index;
