@@ -302,8 +302,8 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         Returns ``None`` when the cuDNN front-end package is older than
         1.23.0.
         """
-        if not _nvidia_cudnn_frontend_supports_wgrad():
-            return None
+        #if not _nvidia_cudnn_frontend_supports_wgrad():
+        #    return None
         from cudnn import grouped_gemm_wgrad_wrapper_sm100  # pylint: disable=no-name-in-module
 
         return grouped_gemm_wgrad_wrapper_sm100
